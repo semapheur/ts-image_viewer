@@ -47,6 +47,18 @@ export const HIST_RANGE: SliderSpec[] = [
   { key: "histHi", label: "Range high", min: 0.02, max: 1, neutral: 1 },
 ];
 
+export const BIT_DEPTH: SliderSpec[] = [
+  {
+    key: "bitDepth",
+    label: "Bits / channel",
+    min: 1,
+    max: 16,
+    step: 1,
+    neutral: 16,
+  },
+  { key: "dither", label: "Dither", min: 0, max: 1, neutral: 0 },
+];
+
 export const CLIP: SliderSpec[] = [
   {
     key: "clipLo",

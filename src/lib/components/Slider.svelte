@@ -31,7 +31,7 @@
     bind:value
     ondblclick={() => (value = neutral)}
   />
-  <output>{value.toFixed(2)}</output>
+  <output>{value.toFixed(Number.isInteger(step) ? 0 : 2)}</output>
 </label>
 
 <style>

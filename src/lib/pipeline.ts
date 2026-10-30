@@ -1,12 +1,12 @@
-/**
- * GPU pipeline (Three.js WebGPURenderer + TSL)
- *
- *   source ─► A: bilateral denoise ─► RT_A (linear, half-float)
- *   RT_A   ─► B: sharpen ─► sRGB encode ─► band stretch ─► exposure ─► tone chain ─► RT_B
- *   RT_B   ─► C: zoom/pan display quad ─► canvas
- *   RT_B   ─► D: compute: atomicAdd histogram ─► storage buffer ─► CPU
- *   source ─► E: compute: fine "extent" histogram (once per image, drives auto stretch)
- *   RT_B/source ─► F: compute: single-pixel picker
+/*
+  GPU pipeline (Three.js WebGPURenderer + TSL)
+
+  source ─► A: bilateral denoise ─► RT_A (linear, half-float)
+  RT_A   ─► B: sharpen ─► sRGB encode ─► band stretch ─► exposure ─► tone chain ─► RT_B
+  RT_B   ─► C: zoom/pan display quad ─► canvas
+  RT_B   ─► D: compute: atomicAdd histogram ─► storage buffer ─► CPU
+  source ─► E: compute: fine "extent" histogram (once per image, drives auto stretch)
+  RT_B/source ─► F: compute: single-pixel picker
  */
 import * as THREE from "three/webgpu";
 import {
@@ -37,8 +37,19 @@ import {
   clamp,
 } from "three/tsl";
 import type { ParamValues } from "./contexts/params.svelte";
+import type { RGB } from "./types";
 
-export type RGB = [number, number, number];
+/**
+ * A high-bit-depth source: linear-light RGBA floats in 0..1, row 0 = top.
+ * Float32 keeps every 16-bit level exact (half-float would not).
+ */
+export interface DeepImage {
+  width: number;
+  height: number;
+  data: Float32Array; // RGBA, linear light
+  bitDepth: number;
+}
+const isDeep = (s: ImageBitmap | DeepImage): s is DeepImage => "data" in s;
 
 // Rectangle in image pixels (y down): x0,y0 inclusive, x1,y1 exclusive.
 export interface Region {
@@ -48,7 +59,7 @@ export interface Region {
   y1: number;
 }
 
-export const EBINS = 1024;
+export const EBINS = 4096;
 export const BINS = 256;
 export const CHANNELS = 4; // R, G, B, luma
 
@@ -58,7 +69,7 @@ export class Pipeline {
   renderer!: THREE.WebGPURenderer;
 
   // One uniform per parameter, updated without rebuilding shaders.
-  private u = {
+  #u = {
     exposure: uniform(0),
     brightness: uniform(0),
     contrast: uniform(1),
@@ -79,10 +90,12 @@ export class Pipeline {
     stretchMode: uniform(0),
     curveStrength: uniform(5),
     midtone: uniform(0.5),
+    bitDepth: uniform(16),
+    dither: uniform(0),
   };
 
   // View (zoom/pan) uniforms
-  private v = {
+  #v = {
     zoom: uniform(1),
     cx: uniform(0),
     cy: uniform(0),
@@ -90,35 +103,39 @@ export class Pipeline {
     vh: uniform(1),
   };
 
-  private src?: THREE.Texture;
-  private rtA?: THREE.RenderTarget;
-  private rtB?: THREE.RenderTarget;
-  private quads: THREE.QuadMesh[] = [];
+  #src?: THREE.Texture;
+  #rtA?: THREE.RenderTarget;
+  #rtB?: THREE.RenderTarget;
+  #quads: THREE.QuadMesh[] = [];
 
-  private histNode?: any;
-  private clearPass?: any;
-  private accumPass?: any;
+  #histNode?: any;
+  #clearPass?: any;
+  #accumPass?: any;
 
-  private pick = { x: uniform(0), y: uniform(0) };
-  private pickPass?: any;
-  private pickOut?: any;
+  #pick = { x: uniform(0), y: uniform(0) };
+  #pickPass?: any;
+  #pickOut?: any;
 
-  private extentNode?: any;
-  private extentClear?: any;
-  private extentAccum?: any;
+  #extentNode?: any;
+  #extentClear?: any;
+  #extentAccum?: any;
   // Region the extent histogram is restricted to (image pixels).
-  private region = {
+  #region = {
     x0: uniform(0, "uint"),
     y0: uniform(0, "uint"),
     w: uniform(1, "uint"),
     count: uniform(1, "uint"),
   };
-  private imgW = 0;
-  private imgH = 0;
+  #imgW = 0;
+  #imgH = 0;
+  #deepPath = false;
+  hasFloat32 = false;
 
   async init(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
     await this.renderer.init();
+    const device = this.renderer.backend?.device;
+    this.hasFloat32 = !!device?.features?.has("float32-filterable");
     // RT_B already holds sRGB-encoded values, so don't encode again on output.
     this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
     this.renderer.setPixelRatio(window.devicePixelRatio);
@@ -126,53 +143,75 @@ export class Pipeline {
 
   resize(cssW: number, cssH: number) {
     this.renderer.setSize(cssW, cssH, false);
-    this.v.vw.value = cssW;
-    this.v.vh.value = cssH;
+    this.#v.vw.value = cssW;
+    this.#v.vh.value = cssH;
   }
 
   setParams(p: ParamValues) {
-    for (const k in this.u) (this.u as any)[k].value = (p as any)[k];
+    for (const k in this.#u) (this.#u as any)[k].value = (p as any)[k];
   }
 
   setView(cx: number, cy: number, zoom: number) {
-    this.v.cx.value = cx;
-    this.v.cy.value = cy;
-    this.v.zoom.value = zoom;
+    this.#v.cx.value = cx;
+    this.#v.cy.value = cy;
+    this.#v.zoom.value = zoom;
   }
 
   // Cheap redraw for pan/zoom: display pass only.
   drawView() {
-    if (!this.quads[2]) return;
+    if (!this.#quads[2]) return;
     this.renderer.setRenderTarget(null);
-    this.quads[2].render(this.renderer);
+    this.#quads[2].render(this.renderer);
   }
 
   // (Re)build all GPU resources for a new image.
-  setImage(bitmap: ImageBitmap) {
-    this.disposeImage();
-    const w = bitmap.width,
-      h = bitmap.height;
-    this.imgW = w;
-    this.imgH = h;
-    const u = this.u;
+  setImage(source: ImageBitmap | DeepImage) {
+    this.#disposeImage();
+    const deep = isDeep(source);
+    if (deep && !this.hasFloat32) {
+      throw new Error("The 16-bit ");
+    }
+    this.#deepPath = deep;
+    const w = source.width;
+    const h = source.height;
+    this.#imgW = w;
+    this.#imgH = h;
+    const u = this.#u;
 
-    const src = new THREE.Texture(bitmap as any);
-    src.colorSpace = THREE.SRGBColorSpace; // sampled values are decoded to linear
+    let src: THREE.Texture;
+    if (isDeep(source)) {
+      // Already linear light, so no colour-space conversion is wanted. Same memory layout as an uploaded bitmap (row 0 = top), so pass A's flip still applies.
+
+      src = new THREE.DataTexture(
+        source.data,
+        w,
+        h,
+        THREE.RGBAFormat,
+        THREE.FloatType,
+      );
+      src.colorSpace = THREE.NoColorSpace;
+    } else {
+      src = new THREE.Texture(source as any);
+      src.colorSpace = THREE.SRGBColorSpace; // sampled values are decoded to linear
+    }
     src.minFilter = src.magFilter = THREE.LinearFilter;
     src.generateMipmaps = false;
     src.needsUpdate = true;
-    this.src = src;
+    this.#src = src;
+
+    const rtType = deep ? THREE.FloatType : THREE.HalfFloatType;
+    const quantizeBelow = deep ? 16.5 : 15.5;
 
     const makeRT = () =>
       new THREE.RenderTarget(w, h, {
-        type: THREE.HalfFloatType,
+        type: rtType,
         format: THREE.RGBAFormat,
         depthBuffer: false,
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,
       });
-    const rtA = (this.rtA = makeRT());
-    const rtB = (this.rtB = makeRT());
+    const rtA = (this.#rtA = makeRT());
+    const rtB = (this.#rtB = makeRT());
     const texel = vec2(1 / w, 1 / h);
 
     // colour helpers
@@ -283,13 +322,30 @@ export class Pipeline {
         .div(sHi.sub(sLo));
       v = mix(v, sig, step(0.01, u.sigmoidAmount));
 
-      return vec4(clamp(v, 0, 1), 1);
+      // bot depth: quantise each band to 2^bit levels (displau deferred values)
+      v = clamp(v, 0, 1);
+      const levels = pow(float(2), u.bitDepth).sub(1);
+      // Interleaved-gradient noise anchored to image pixels, so it is stable under zoom/pan.
+      const px = uv().mul(vec2(w, h)).floor();
+      const noise = dot(px, vec2(0.06711056, 0.00583715))
+        .fract()
+        .mul(52.9829189)
+        .fract();
+      const jitter = noise.sub(0.5).mul(u.dither); // same offset for all bands: no colour noise
+      const quantised = clamp(
+        v.mul(levels).add(0.5).add(jitter).floor().div(levels),
+        0,
+        1,
+      );
+      v = mix(v, quantised, step(u.bitDepth, float(quantizeBelow)));
+
+      return vec4(v, 1);
     });
 
     // Pass C: zoom/pan display
     const BG = vec3(34 / 255, 37 / 255, 42 / 255); // matches --well
     const display = Fn(() => {
-      const view = this.v;
+      const view = this.#v;
       // screen position in CSS px, y down
       const sx = uv().x.mul(view.vw);
       const sy = uv().y.mul(view.vh);
@@ -310,20 +366,20 @@ export class Pipeline {
     matB.fragmentNode = tonal();
     const matC = new THREE.NodeMaterial();
     matC.fragmentNode = display();
-    this.quads = [matA, matB, matC].map((m) => new THREE.QuadMesh(m));
+    this.#quads = [matA, matB, matC].map((m) => new THREE.QuadMesh(m));
 
     // Pass D: display histogram
     const total = w * h;
     const histNode = instancedArray(BINS * CHANNELS, "uint");
     const hist = histNode.toAtomic();
-    this.histNode = histNode;
+    this.#histNode = histNode;
 
-    this.clearPass = Fn(() => {
+    this.#clearPass = Fn(() => {
       atomicStore(hist.element(instanceIndex), uint(0));
     })().compute(BINS * CHANNELS);
 
     const pixels = texture(rtB.texture);
-    this.accumPass = Fn(() => {
+    this.#accumPass = Fn(() => {
       If(instanceIndex.lessThan(uint(total)), () => {
         const x = instanceIndex.mod(uint(w));
         const y = instanceIndex.div(uint(w));
@@ -348,15 +404,15 @@ export class Pipeline {
     // Pass E: extent histogram of the source (once per image)
     const extNode = instancedArray(EBINS * CHANNELS, "uint");
     const ext = extNode.toAtomic();
-    this.extentNode = extNode;
+    this.#extentNode = extNode;
 
-    this.extentClear = Fn(() => {
+    this.#extentClear = Fn(() => {
       atomicStore(ext.element(instanceIndex), uint(0));
     })().compute(EBINS * CHANNELS);
 
     // Only pixels inside `region` are counted. Threads beyond region.count exit at once.
-    const region = this.region;
-    this.extentAccum = Fn(() => {
+    const region = this.#region;
+    this.#extentAccum = Fn(() => {
       If(instanceIndex.lessThan(region.count), () => {
         const x = region.x0.add(instanceIndex.mod(region.w)).toFloat();
         const y = region.y0.add(instanceIndex.div(region.w)).toFloat();
@@ -382,13 +438,13 @@ export class Pipeline {
 
     // Pass F: pixel picker
     const pickOut = instancedArray(8, "float"); // [adj r,g,b,_, orig r,g,b,_]
-    this.pickOut = pickOut;
-    this.pickPass = Fn(() => {
+    this.#pickOut = pickOut;
+    this.#pickPass = Fn(() => {
       If(instanceIndex.equal(uint(0)), () => {
         // pixel centre in the same (u, v) convention the display pass samples with
         const p = vec2(
-          this.pick.x.add(0.5).div(w),
-          this.pick.y.add(0.5).div(h),
+          this.#pick.x.add(0.5).div(w),
+          this.#pick.y.add(0.5).div(h),
         );
         const adj = texture(rtB.texture, p).level(0).rgb;
         // original: undo the vertical flip pass A applies when reading the source
@@ -405,23 +461,23 @@ export class Pipeline {
     })().compute(1);
   }
 
-  /**
-   * Fine histogram of the source image: 4 * EBINS counts (R, G, B, luma).
-   * Pass a region (image pixels) to restrict it, e.g. to the visible area; default is the whole image.
-   */
+  /*
+    Fine histogram of the source image: 4 * EBINS counts (R, G, B, luma).
+    Pass a region (image pixels) to restrict it, e.g. to the visible area; default is the whole image.
+  */
   async computeExtent(r?: Region): Promise<Uint32Array> {
-    const extentNode = this.extentNode;
-    const w = this.imgW,
-      h = this.imgH;
+    const extentNode = this.#extentNode;
+    const w = this.#imgW,
+      h = this.#imgH;
     const x0 = Math.max(0, Math.min(w - 1, Math.floor(r?.x0 ?? 0)));
     const y0 = Math.max(0, Math.min(h - 1, Math.floor(r?.y0 ?? 0)));
     const x1 = Math.max(x0 + 1, Math.min(w, Math.ceil(r?.x1 ?? w)));
     const y1 = Math.max(y0 + 1, Math.min(h, Math.ceil(r?.y1 ?? h)));
-    this.region.x0.value = x0;
-    this.region.y0.value = y0;
-    this.region.w.value = x1 - x0;
-    this.region.count.value = (x1 - x0) * (y1 - y0);
-    await this.renderer.computeAsync([this.extentClear, this.extentAccum]);
+    this.#region.x0.value = x0;
+    this.#region.y0.value = y0;
+    this.#region.w.value = x1 - x0;
+    this.#region.count.value = (x1 - x0) * (y1 - y0);
+    await this.renderer.computeAsync([this.#extentClear, this.#extentAccum]);
     const buf = await this.renderer.getArrayBufferAsync(extentNode.value);
     return new Uint32Array(buf.slice(0));
   }
@@ -430,42 +486,75 @@ export class Pipeline {
     x: number,
     y: number,
   ): Promise<{ adjusted: RGB; original: RGB }> {
-    const pickOut = this.pickOut;
-    this.pick.x.value = x;
-    this.pick.y.value = y;
-    await this.renderer.computeAsync(this.pickPass);
+    const pickOut = this.#pickOut;
+    this.#pick.x.value = x;
+    this.#pick.y.value = y;
+    await this.renderer.computeAsync(this.#pickPass);
     const f = new Float32Array(
       await this.renderer.getArrayBufferAsync(pickOut.value),
     );
     return { adjusted: [f[0], f[1], f[2]], original: [f[4], f[5], f[6]] };
   }
 
-  /** Run all passes, then read the histogram back. Returns 4*256 counts: R,G,B,luma. */
+  // Run all passes, then read the histogram back. Returns 4*256 counts: R,G,B,luma.
   async render(): Promise<Uint32Array> {
-    if (!this.rtA || !this.rtB) return new Uint32Array(BINS * CHANNELS);
+    if (!this.#rtA || !this.#rtB) return new Uint32Array(BINS * CHANNELS);
     const r = this.renderer;
-    const histNode = this.histNode; // captured: setImage() may swap it while we await
-    r.setRenderTarget(this.rtA);
-    this.quads[0].render(r);
-    r.setRenderTarget(this.rtB);
-    this.quads[1].render(r);
+    const histNode = this.#histNode; // captured: setImage() may swap it while we await
+    r.setRenderTarget(this.#rtA);
+    this.#quads[0].render(r);
+    r.setRenderTarget(this.#rtB);
+    this.#quads[1].render(r);
     r.setRenderTarget(null);
-    this.quads[2].render(r);
-    await r.computeAsync([this.clearPass, this.accumPass]);
+    this.#quads[2].render(r);
+    await r.computeAsync([this.#clearPass, this.#accumPass]);
     const buf = await r.getArrayBufferAsync(histNode.value);
     return new Uint32Array(buf.slice(0));
   }
 
-  private disposeImage() {
-    this.src?.dispose();
-    this.rtA?.dispose();
-    this.rtB?.dispose();
-    this.quads.forEach((q) => (q.material as THREE.Material | null)?.dispose());
-    this.quads = [];
+  get isDeepPath() {
+    return this.#deepPath;
+  }
+
+  /** The processed image as RGB floats in 0..1, top row first (for export). */
+  async readOutput(): Promise<{
+    width: number;
+    height: number;
+    data: Float32Array;
+  }> {
+    if (!this.#rtB) throw new Error("No image loaded");
+    const w = this.#imgW,
+      h = this.#imgH;
+    const raw: any = await this.renderer.readRenderTargetPixelsAsync(
+      this.#rtB,
+      0,
+      0,
+      w,
+      h,
+    );
+    const half = !this.#deepPath; // half-float targets come back as raw 16-bit half values
+    const out = new Float32Array(w * h * 3);
+    for (let i = 0, n = w * h; i < n; i++) {
+      for (let c = 0; c < 3; c++) {
+        const v = raw[i * 4 + c];
+        out[i * 3 + c] = half ? THREE.DataUtils.fromHalfFloat(v) : v;
+      }
+    }
+    return { width: w, height: h, data: out };
+  }
+
+  #disposeImage() {
+    this.#src?.dispose();
+    this.#rtA?.dispose();
+    this.#rtB?.dispose();
+    this.#quads.forEach((q) =>
+      (q.material as THREE.Material | null)?.dispose(),
+    );
+    this.#quads = [];
   }
 
   dispose() {
-    this.disposeImage();
+    this.#disposeImage();
     this.renderer?.dispose();
   }
 }

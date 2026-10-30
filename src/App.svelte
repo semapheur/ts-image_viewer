@@ -9,6 +9,7 @@
   import HistogramPanel from "./lib/components/HistogramPanel.svelte";
   import PixelPanel from "./lib/components/PixelPanel.svelte";
   import StretchPanel from "./lib/components/StretchPanel.svelte";
+  import OutputPanel from "./lib/components/OutputPanel.svelte";
 
   const params = new Params();
   setParams(params);
@@ -30,6 +31,7 @@
     <SliderPanel title="Tone" specs={TONE} />
     <StretchPanel />
     <SliderPanel title="Detail" specs={DETAIL} />
+    <OutputPanel />
 
     <div class="actions">
       <button onclick={params.reset}>Reset all</button>

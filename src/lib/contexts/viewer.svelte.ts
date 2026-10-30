@@ -2,10 +2,10 @@ import { createContext, tick, untrack } from "svelte";
 import { Pipeline, type Region } from "../pipeline";
 import { extentOf } from "../band_stretch";
 import { View } from "../view";
+import { decodeImage, encodePng16, saveBlob } from "../image_io";
 import type { RGB } from "../types";
 import type { Params } from "./params.svelte";
 
-const MAX_DIM = 4096;
 // Minimum gap between visible-region extent updates while panning/zooming.
 const REGION_INTERVAL_MS = 80;
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -17,25 +17,8 @@ export interface PickedPixel {
   original: RGB;
 }
 
-// Decode a file, downscaling so the longest side is at most MAX_DIM.
-async function decodeImage(file: File): Promise<ImageBitmap> {
-  const full = await createImageBitmap(file);
-  const s = Math.min(1, MAX_DIM / Math.max(full.width, full.height));
-  if (s === 1) return full;
-  const small = await createImageBitmap(full, {
-    resizeWidth: Math.round(full.width * s),
-    resizeHeight: Math.round(full.height * s),
-    resizeQuality: "high",
-  });
-  full.close(); // free the full-size pixels
-  return small;
-}
-
-/**
- * Owns the GPU pipeline, the zoom/pan state and everything derived from them.
- * Components read its reactive fields and call its methods; they never touch
- * the pipeline directly. Construct it during component initialisation
- * (it registers $effects).
+/*
+  Owns the GPU pipeline, the zoom/pan state and everything derived from them. Components read its reactive fields and call its methods; they never touch the pipeline directly. Construct it during component initialisation (it registers $effects).
  */
 export class Viewer {
   // Zoom/pan maths. Not reactive: read `vs` in templates.
@@ -45,6 +28,7 @@ export class Viewer {
   gpuReady = $state(false);
   imageReady = $state(false);
   loading = $state(false);
+  deep = $state(false); // One-line description of how the source was decoded.
   error = $state("");
   img = $state({ w: 0, h: 0 });
   hist = $state.raw<Uint32Array | null>(null);
@@ -64,34 +48,34 @@ export class Viewer {
   ready = $derived(this.imageReady && !this.loading);
 
   // internals
-  private params: Params;
-  private pipe: Pipeline | null = null;
-  private size = { w: 0, h: 0 };
-  private busy = false;
-  private dirty = false;
-  private drawQueued = false;
-  private regionBusy = false;
-  private regionDirty = false;
-  private lastRegion = "";
-  private disposed = false;
+  #params: Params;
+  #pipe: Pipeline | null = null;
+  #size = { w: 0, h: 0 };
+  #busy = false;
+  #dirty = false;
+  #drawQueued = false;
+  #regionBusy = false;
+  #regionDirty = false;
+  #lastRegion = "";
+  #disposed = false;
 
   constructor(params: Params) {
-    this.params = params;
+    this.#params = params;
 
     // Push parameter changes to the GPU and refresh the histogram.
     $effect(() => {
-      const p = this.params.snapshot(); // tracks every parameter
+      const p = this.#params.snapshot(); // tracks every parameter
       if (!this.ready) return;
-      this.pipe?.setParams(p);
+      this.#pipe?.setParams(p);
       void this.frame();
     });
 
     // Auto stretch: recompute black/white whenever its inputs change. Falls back to the whole-image extent until the visible-area one is ready.
     $effect(() => {
-      const v = this.params.values;
+      const v = this.#params.values;
       if (!v.auto) return;
       const hist = (v.autoVisible ? this.regionHist : null) ?? this.extentHist;
-      if (hist) this.params.applyAuto(hist);
+      if (hist) this.#params.applyAuto(hist);
     });
 
     // Start tracking the visible area when auto (visible-only) is switched on.
@@ -119,37 +103,38 @@ export class Viewer {
       this.error = String(e);
       return;
     }
-    if (this.disposed) {
+    if (this.#disposed) {
       pipe.dispose(); // unmounted while the GPU was starting up
       return;
     }
-    this.pipe = pipe;
+    this.#pipe = pipe;
     this.gpuReady = true;
   }
 
   dispose() {
-    this.disposed = true;
-    this.pipe?.dispose();
-    this.pipe = null;
+    this.#disposed = true;
+    this.#pipe?.dispose();
+    this.#pipe = null;
   }
 
   async load(file: File | undefined) {
-    const pipe = this.pipe;
+    const pipe = this.#pipe;
     if (!file || !pipe || this.loading) return;
 
     const previous = this.bitmap;
     this.loading = true;
     try {
-      const bmp = await decodeImage(file);
-      pipe.setImage(bmp);
+      const dec = await decodeImage(file, pipe.hasFloat32);
+      pipe.setImage(dec.deep ?? dec.bitmap);
       // Update everything that describes the image *before* any further await, so it never disagrees with the pipeline.
-      this.bitmap = bmp;
-      this.img = { w: bmp.width, h: bmp.height };
-      this.view.setImage(bmp.width, bmp.height);
+      this.bitmap = dec.bitmap;
+      this.img = { w: dec.width, h: dec.height };
+      this.deep = !!dec.deep;
+      this.view.setImage(dec.width, dec.height);
       this.picked = null;
       this.hist = null;
       this.regionHist = null;
-      this.lastRegion = "";
+      this.#lastRegion = "";
       this.extentHist = await pipe.computeExtent();
       this.imageReady = true;
       this.error = "";
@@ -162,7 +147,7 @@ export class Viewer {
 
     await tick(); // lets the canvas un-hide and auto-stretch effects run
     previous?.close();
-    pipe.setParams(this.params.snapshot());
+    pipe.setParams(this.#params.snapshot());
     this.applySize();
     void this.frame();
   }
@@ -171,31 +156,31 @@ export class Viewer {
 
   // Coalesces rapid changes: at most one GPU frame in flight, latest params win.
   async frame() {
-    const pipe = this.pipe;
+    const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
-    if (this.busy) {
-      this.dirty = true;
+    if (this.#busy) {
+      this.#dirty = true;
       return;
     }
-    this.busy = true;
+    this.#busy = true;
     try {
       do {
-        this.dirty = false;
+        this.#dirty = false;
         this.hist = await pipe.render();
         const p = this.picked; // keep the inspector live while sliders move
         if (p)
           this.picked = { x: p.x, y: p.y, ...(await pipe.pickPixel(p.x, p.y)) };
-      } while (this.dirty && this.ready && !this.disposed);
+      } while (this.#dirty && this.ready && !this.#disposed);
     } catch (e) {
       this.error = String(e);
     } finally {
-      this.busy = false;
+      this.#busy = false;
     }
   }
 
   // Immediate redraw of the display pass (cheap: no histogram).
   private draw() {
-    const pipe = this.pipe;
+    const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
     const v = this.view;
     pipe.setView(v.cx, v.cy, v.zoom);
@@ -206,24 +191,24 @@ export class Viewer {
   }
 
   requestDraw() {
-    if (this.drawQueued) return;
-    this.drawQueued = true;
+    if (this.#drawQueued) return;
+    this.#drawQueued = true;
     requestAnimationFrame(() => {
-      this.drawQueued = false;
+      this.#drawQueued = false;
       this.draw();
     });
   }
 
   // Called by the viewport whenever its size changes.
   resize(w: number, h: number) {
-    this.size = { w, h };
+    this.#size = { w, h };
     this.applySize();
   }
 
   private applySize() {
-    const { w, h } = this.size;
-    if (!this.pipe || !this.img.w || !w || !h) return;
-    this.pipe.resize(w, h); // clears the canvas, so draw straight away
+    const { w, h } = this.#size;
+    if (!this.#pipe || !this.img.w || !w || !h) return;
+    this.#pipe.resize(w, h); // clears the canvas, so draw straight away
     this.view.setViewport(w, h);
     this.draw();
   }
@@ -231,7 +216,7 @@ export class Viewer {
   // visible-area auto range
 
   private wantsRegion() {
-    const v = this.params.values;
+    const v = this.#params.values;
     return v.auto && v.autoVisible;
   }
 
@@ -253,34 +238,34 @@ export class Viewer {
     };
   }
 
-  /**
-   * Recompute the extent histogram for the visible area. One computation in flight,
-   * latest view wins, at most one every REGION_INTERVAL_MS. Skipped if the region is unchanged.
-   */
+  /*
+    Recompute the extent histogram for the visible area. One computation in flight,
+    latest view wins, at most one every REGION_INTERVAL_MS. Skipped if the region is unchanged.
+  */
   private async requestRegionExtent() {
-    const pipe = this.pipe;
+    const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
-    if (this.regionBusy) {
-      this.regionDirty = true;
+    if (this.#regionBusy) {
+      this.#regionDirty = true;
       return;
     }
-    this.regionBusy = true;
+    this.#regionBusy = true;
     try {
       do {
-        this.regionDirty = false;
+        this.#regionDirty = false;
         const r = this.visibleRegion();
         const key = `${r.x0},${r.y0},${r.x1},${r.y1}`;
-        if (key !== this.lastRegion) {
-          this.lastRegion = key;
+        if (key !== this.#lastRegion) {
+          this.#lastRegion = key;
           this.regionHist = await pipe.computeExtent(r);
         }
-        if (this.regionDirty) await wait(REGION_INTERVAL_MS);
-      } while (this.regionDirty && this.ready && !this.disposed);
+        if (this.#regionDirty) await wait(REGION_INTERVAL_MS);
+      } while (this.#regionDirty && this.ready && !this.#disposed);
     } catch (e) {
-      this.lastRegion = ""; // retry next time
+      this.#lastRegion = ""; // retry next time
       this.error = String(e);
     } finally {
-      this.regionBusy = false;
+      this.#regionBusy = false;
     }
   }
 
@@ -325,10 +310,27 @@ export class Viewer {
     else this.zoomTo(sx, sy, 1);
   }
 
+  // export
+
+  // Save the processed image (not just the visible part) as a 16-bit PNG.
+  async exportPng() {
+    const pipe = this.#pipe;
+    if (!pipe || !this.ready) return;
+    try {
+      const { width, height, data } = await pipe.readOutput();
+      saveBlob(
+        new Blob([encodePng16(width, height, data)], { type: "image/png" }),
+        "export-16bit.png",
+      );
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
   // pixel inspector
 
   async pickAt(sx: number, sy: number) {
-    const pipe = this.pipe;
+    const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
     const { cx, cy, zoom, viewW, viewH } = this.view;
     // screen -> image pixel, same maths as the display shader

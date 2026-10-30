@@ -32,6 +32,8 @@ export const DEFAULTS = {
   linked: true,
   clipLo: 0.1, // % of pixels allowed to clip, shadows
   clipHi: 0.1, // % of pixels allowed to clip, highlights
+  bitDepth: 16,
+  dither: 0,
 };
 
 export type ParamValues = typeof DEFAULTS;

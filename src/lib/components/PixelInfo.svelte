@@ -1,11 +1,13 @@
 <script lang="ts">
-  type RGB = [number, number, number];
-  let {
-    x,
-    y,
-    adjusted,
-    original,
-  }: { x: number; y: number; adjusted: RGB; original: RGB } = $props();
+  import type { RGB } from "../types";
+
+  interface Props {
+    x: number;
+    y: number;
+    adjusted: RGB;
+    original: RGB;
+  }
+  let { x, y, adjusted, original }: Props = $props();
 
   const byte = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
   const hex = (c: RGB) =>

@@ -19,7 +19,7 @@
   }
   let drag: Drag | null = null;
 
-  // ───────────── attachments ─────────────
+  // attachments
 
   // Start the GPU once the canvas exists.
   const gpu: Attachment<HTMLCanvasElement> = (canvas) => {
@@ -46,10 +46,9 @@
       return () => node.removeEventListener("wheel", handler);
     };
 
-  // ───────────── input handling ─────────────
+  // input handling
 
-  // The handlers below are all attached to the stage, so `currentTarget` is the stage.
-  // It has the same box as the canvas, so no element references are needed.
+  // The handlers below are all attached to the stage, so `currentTarget` is the stage. It has the same box as the canvas, so no element references are needed.
   const local = (e: MouseEvent): [number, number] => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
