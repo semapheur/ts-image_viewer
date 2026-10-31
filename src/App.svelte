@@ -9,6 +9,7 @@
   import HistogramPanel from "./lib/components/HistogramPanel.svelte";
   import PixelPanel from "./lib/components/PixelPanel.svelte";
   import StretchPanel from "./lib/components/StretchPanel.svelte";
+  import SigmoidPanel from "./lib/components/SigmoidPanel.svelte";
   import OutputPanel from "./lib/components/OutputPanel.svelte";
 
   const params = new Params();
@@ -29,6 +30,7 @@
 <main>
   <aside>
     <SliderPanel title="Tone" specs={TONE} />
+    <SigmoidPanel />
     <StretchPanel />
     <SliderPanel title="Detail" specs={DETAIL} />
     <OutputPanel />

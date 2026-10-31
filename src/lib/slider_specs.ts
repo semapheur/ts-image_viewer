@@ -1,6 +1,6 @@
 import type { ParamValues } from "./contexts/params.svelte";
 
-/** Keys of ParamValues whose value is a number (the ones a slider can bind to). */
+// Keys of ParamValues whose value is a number (the ones a slider can bind to)
 export type NumericParam = {
   [K in keyof ParamValues]: ParamValues[K] extends number ? K : never;
 }[keyof ParamValues];
@@ -20,21 +20,6 @@ export const TONE: SliderSpec[] = [
   { key: "contrast", label: "Contrast", min: 0, max: 2, neutral: 1 },
   { key: "saturation", label: "Saturation", min: 0, max: 2, neutral: 1 },
   { key: "gamma", label: "Gamma", min: 0.2, max: 3, neutral: 1 },
-  {
-    key: "sigmoidAmount",
-    label: "Sigmoidal",
-    min: 0,
-    max: 15,
-    step: 0.1,
-    neutral: 0,
-  },
-  {
-    key: "sigmoidMid",
-    label: "Sigmoid mid",
-    min: 0.05,
-    max: 0.95,
-    neutral: 0.5,
-  },
 ];
 
 export const DETAIL: SliderSpec[] = [
@@ -93,7 +78,7 @@ export const STRENGTH: SliderSpec[] = [
   },
 ];
 
-/** Per-band black/white sliders, used when bands are not linked. */
+// Per-band black/white sliders, used when bands are not linked.
 export const BAND_SPECS: SliderSpec[] = (["R", "G", "B"] as const).flatMap(
   (n) => [
     {

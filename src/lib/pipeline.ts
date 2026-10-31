@@ -35,8 +35,10 @@ import {
   dot,
   step,
   clamp,
+  sin,
 } from "three/tsl";
 import type { ParamValues } from "./contexts/params.svelte";
+import type { Interpolation } from "./interpolation";
 import type { RGB } from "./types";
 
 /**
@@ -107,6 +109,9 @@ export class Pipeline {
   #rtA?: THREE.RenderTarget;
   #rtB?: THREE.RenderTarget;
   #quads: THREE.QuadMesh[] = [];
+  #interpolation: Interpolation = "bilinear";
+  #displayQuads = new Map<Interpolation, THREE.QuadMesh>();
+  #makeDisplay?: (mode: Interpolation) => THREE.QuadMesh;
 
   #histNode?: any;
   #clearPass?: any;
@@ -157,11 +162,25 @@ export class Pipeline {
     this.#v.zoom.value = zoom;
   }
 
+  setInterpolation(mode: Interpolation) {
+    this.#interpolation = mode;
+  }
+
+  #displayQuad(): THREE.QuadMesh | undefined {
+    let q = this.#displayQuads.get(this.#interpolation);
+    if (!q && this.#makeDisplay) {
+      q = this.#makeDisplay(this.#interpolation);
+      this.#displayQuads.set(this.#interpolation, q);
+    }
+    return q;
+  }
+
   // Cheap redraw for pan/zoom: display pass only.
   drawView() {
-    if (!this.#quads[2]) return;
+    const q = this.#displayQuad();
+    if (!q) return;
     this.renderer.setRenderTarget(null);
-    this.#quads[2].render(this.renderer);
+    q.render(this.renderer);
   }
 
   // (Re)build all GPU resources for a new image.
@@ -169,7 +188,9 @@ export class Pipeline {
     this.#disposeImage();
     const deep = isDeep(source);
     if (deep && !this.hasFloat32) {
-      throw new Error("The 16-bit ");
+      throw new Error(
+        'The 16-bit path needs the WebGPU "float32-filterable" feature.',
+      );
     }
     this.#deepPath = deep;
     const w = source.width;
@@ -322,7 +343,7 @@ export class Pipeline {
         .div(sHi.sub(sLo));
       v = mix(v, sig, step(0.01, u.sigmoidAmount));
 
-      // bot depth: quantise each band to 2^bit levels (displau deferred values)
+      // bit depth: quantise each band to 2^bit levels (display deferred values)
       v = clamp(v, 0, 1);
       const levels = pow(float(2), u.bitDepth).sub(1);
       // Interleaved-gradient noise anchored to image pixels, so it is stable under zoom/pan.
@@ -344,28 +365,114 @@ export class Pipeline {
 
     // Pass C: zoom/pan display
     const BG = vec3(34 / 255, 37 / 255, 42 / 255); // matches --well
-    const display = Fn(() => {
-      const view = this.#v;
-      // screen position in CSS px, y down
-      const sx = uv().x.mul(view.vw);
-      const sy = uv().y.mul(view.vh);
-      // image position in pixels, y down
-      const ix = view.cx.add(sx.sub(view.vw.mul(0.5)).div(view.zoom));
-      const iy = view.cy.add(sy.sub(view.vh.mul(0.5)).div(view.zoom));
-      const col = texture(rtB.texture, vec2(ix.div(w), iy.div(h))).rgb;
-      const inside = step(float(0), ix)
-        .mul(step(ix, float(w)))
-        .mul(step(float(0), iy))
-        .mul(step(iy, float(h)));
-      return vec4(mix(BG, col, inside), 1);
-    });
+
+    // Colour of image texel (px, py), read at its exact centre so the sampler can't blend it.
+    const texelAt = (px: any, py: any) =>
+      texture(rtB.texture, vec2(px.add(0.5).div(w), py.add(0.5).div(h))).rgb;
+
+    // Mitchell-Netravali family (B, C): (0, 0.5) = Catmull-Rom, (1/3, 1/3) = Mitchell.
+    const bcKernel = (B: number, C: number) => (x: any) => {
+      const ax = x.abs();
+      const ax2 = ax.mul(ax);
+      const ax3 = ax2.mul(ax);
+      const near = ax3
+        .mul((12 - 9 * B - 6 * C) / 6)
+        .add(ax2.mul((-18 + 12 * B + 6 * C) / 6))
+        .add((6 - 2 * B) / 6);
+      const far = ax3
+        .mul((-B - 6 * C) / 6)
+        .add(ax2.mul((6 * B + 30 * C) / 6))
+        .add(ax.mul((-12 * B - 48 * C) / 6))
+        .add((8 * B + 24 * C) / 6);
+      // |x| <= 1 -> near, 1 < |x| <= 2 -> far, beyond -> 0
+      return mix(far.mul(step(ax, float(2))), near, step(ax, float(1)));
+    };
+
+    const lanczos3 = (x: any) => {
+      const ax = x.abs();
+      const px = ax.mul(Math.PI);
+      const safe = max(px, 1e-5);
+      // sinc(x) * sinc(x / 3), with the x -> 0 limit of 1
+      const val = sin(px)
+        .mul(sin(px.div(3)))
+        .mul(3)
+        .div(safe.mul(safe));
+      return mix(val, float(1), step(ax, float(1e-4))).mul(step(ax, float(3)));
+    };
+
+    // Separable kernel resampling over offsets x offsets taps, weights normalised per axis.
+    const separable = (
+      ix: any,
+      iy: any,
+      offsets: number[],
+      kernel: (x: any) => any,
+    ) => {
+      const pos = vec2(ix.sub(0.5), iy.sub(0.5));
+      const base = pos.floor();
+      const f = pos.sub(base);
+      const norm = (t: any) => {
+        const raw = offsets.map((k) => kernel(t.sub(k)));
+        const sum = raw.reduce((a, b) => a.add(b));
+        return raw.map((wgt) => wgt.div(sum));
+      };
+      const wx = norm(f.x);
+      const wy = norm(f.y);
+      let acc: any = vec3(0);
+      offsets.forEach((oy, j) => {
+        offsets.forEach((ox, i) => {
+          acc = acc.add(
+            texelAt(base.x.add(ox), base.y.add(oy)).mul(wx[i].mul(wy[j])),
+          );
+        });
+      });
+      return clamp(acc, 0, 1); // kernels with negative lobes can overshoot
+    };
+
+    const CUBIC = [-1, 0, 1, 2];
+    const LANCZOS = [-2, -1, 0, 1, 2, 3];
+    const resample = (mode: Interpolation, ix: any, iy: any) => {
+      switch (mode) {
+        case "nearest":
+          return texelAt(ix.floor(), iy.floor());
+        case "catmull-rom":
+          return separable(ix, iy, CUBIC, bcKernel(0, 0.5));
+        case "mitchell":
+          return separable(ix, iy, CUBIC, bcKernel(1 / 3, 1 / 3));
+        case "lanczos3":
+          return separable(ix, iy, LANCZOS, lanczos3);
+        default:
+          return texture(rtB.texture, vec2(ix.div(w), iy.div(h))).rgb; // bilinear (hardware)
+      }
+    };
+
+    const buildDisplay = (mode: Interpolation) =>
+      Fn(() => {
+        const view = this.#v;
+        // screen position in CSS px, y down
+        const sx = uv().x.mul(view.vw);
+        const sy = uv().y.mul(view.vh);
+        // image position in pixels, y down
+        const ix = view.cx.add(sx.sub(view.vw.mul(0.5)).div(view.zoom));
+        const iy = view.cy.add(sy.sub(view.vh.mul(0.5)).div(view.zoom));
+        const col = resample(mode, ix, iy);
+        const inside = step(float(0), ix)
+          .mul(step(ix, float(w)))
+          .mul(step(float(0), iy))
+          .mul(step(iy, float(h)));
+        return vec4(mix(BG, col, inside), 1);
+      });
+
+    this.#makeDisplay = (mode) => {
+      const mat = new THREE.NodeMaterial();
+      mat.fragmentNode = buildDisplay(mode)();
+      return new THREE.QuadMesh(mat);
+    };
 
     const matA = new THREE.NodeMaterial();
     matA.fragmentNode = denoise();
     const matB = new THREE.NodeMaterial();
     matB.fragmentNode = tonal();
     const matC = new THREE.NodeMaterial();
-    matC.fragmentNode = display();
     this.#quads = [matA, matB, matC].map((m) => new THREE.QuadMesh(m));
 
     // Pass D: display histogram
@@ -417,8 +524,7 @@ export class Pipeline {
         const x = region.x0.add(instanceIndex.mod(region.w)).toFloat();
         const y = region.y0.add(instanceIndex.div(region.w)).toFloat();
         const p = vec2(x.add(0.5).div(w), y.add(0.5).div(h));
-        // (x, y) is in the display convention (y down), so undo pass A's vertical
-        // flip when reading the source, exactly like the pixel picker does.
+        // (x, y) is in the display convention (y down), so undo pass A's vertical flip when reading the source, exactly like the pixel picker does.
         const c = clamp(
           srgbEncode(texture(src, vec2(p.x, float(1).sub(p.y))).level(0).rgb),
           0,
@@ -506,10 +612,10 @@ export class Pipeline {
     r.setRenderTarget(this.#rtB);
     this.#quads[1].render(r);
     r.setRenderTarget(null);
-    this.#quads[2].render(r);
+    this.#displayQuad()!.render(r);
     await r.computeAsync([this.#clearPass, this.#accumPass]);
-    const buf = await r.getArrayBufferAsync(histNode.value);
-    return new Uint32Array(buf.slice(0));
+    const buffer = await r.getArrayBufferAsync(histNode.value);
+    return new Uint32Array(buffer.slice(0));
   }
 
   get isDeepPath() {
@@ -551,6 +657,11 @@ export class Pipeline {
       (q.material as THREE.Material | null)?.dispose(),
     );
     this.#quads = [];
+    this.#displayQuads.forEach((q) =>
+      (q.material as THREE.Material | null)?.dispose(),
+    );
+    this.#displayQuads.clear();
+    this.#makeDisplay = undefined;
   }
 
   dispose() {

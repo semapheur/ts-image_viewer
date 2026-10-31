@@ -2,6 +2,7 @@ import { createContext, tick, untrack } from "svelte";
 import { Pipeline, type Region } from "../pipeline";
 import { extentOf } from "../band_stretch";
 import { View } from "../view";
+import type { Interpolation } from "../interpolation";
 import { decodeImage, encodePng16, saveBlob } from "../image_io";
 import type { RGB } from "../types";
 import type { Params } from "./params.svelte";
@@ -28,7 +29,9 @@ export class Viewer {
   gpuReady = $state(false);
   imageReady = $state(false);
   loading = $state(false);
-  deep = $state(false); // One-line description of how the source was decoded.
+  deep = $state(false);
+  sourceInfo = $state(""); // One-line description of how the source was decoded.
+  interpolation = $state<Interpolation>("bilinear");
   error = $state("");
   img = $state({ w: 0, h: 0 });
   hist = $state.raw<Uint32Array | null>(null);
@@ -80,8 +83,8 @@ export class Viewer {
 
     // Start tracking the visible area when auto (visible-only) is switched on.
     $effect(() => {
-      if (this.wantsRegion() && this.ready)
-        untrack(() => void this.requestRegionExtent());
+      if (this.#wantsRegion() && this.ready)
+        untrack(() => void this.#requestRegionExtent());
     });
 
     // Release the GPU when the owning component is destroyed.
@@ -107,6 +110,7 @@ export class Viewer {
       pipe.dispose(); // unmounted while the GPU was starting up
       return;
     }
+    pipe.setInterpolation(this.interpolation);
     this.#pipe = pipe;
     this.gpuReady = true;
   }
@@ -130,6 +134,7 @@ export class Viewer {
       this.bitmap = dec.bitmap;
       this.img = { w: dec.width, h: dec.height };
       this.deep = !!dec.deep;
+      this.sourceInfo = dec.info;
       this.view.setImage(dec.width, dec.height);
       this.picked = null;
       this.hist = null;
@@ -148,7 +153,7 @@ export class Viewer {
     await tick(); // lets the canvas un-hide and auto-stretch effects run
     previous?.close();
     pipe.setParams(this.#params.snapshot());
-    this.applySize();
+    this.#applySize();
     void this.frame();
   }
 
@@ -179,7 +184,7 @@ export class Viewer {
   }
 
   // Immediate redraw of the display pass (cheap: no histogram).
-  private draw() {
+  #draw() {
     const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
     const v = this.view;
@@ -187,7 +192,7 @@ export class Viewer {
     pipe.drawView();
     this.vs = { cx: v.cx, cy: v.cy, zoom: v.zoom, w: v.viewW, h: v.viewH };
     // The visible area changed, so the auto range may need to follow it.
-    if (this.wantsRegion()) void this.requestRegionExtent();
+    if (this.#wantsRegion()) void this.#requestRegionExtent();
   }
 
   requestDraw() {
@@ -195,33 +200,33 @@ export class Viewer {
     this.#drawQueued = true;
     requestAnimationFrame(() => {
       this.#drawQueued = false;
-      this.draw();
+      this.#draw();
     });
   }
 
   // Called by the viewport whenever its size changes.
   resize(w: number, h: number) {
     this.#size = { w, h };
-    this.applySize();
+    this.#applySize();
   }
 
-  private applySize() {
+  #applySize() {
     const { w, h } = this.#size;
     if (!this.#pipe || !this.img.w || !w || !h) return;
     this.#pipe.resize(w, h); // clears the canvas, so draw straight away
     this.view.setViewport(w, h);
-    this.draw();
+    this.#draw();
   }
 
   // visible-area auto range
 
-  private wantsRegion() {
+  #wantsRegion() {
     const v = this.#params.values;
     return v.auto && v.autoVisible;
   }
 
   // The part of the image currently on screen, in image pixels.
-  private visibleRegion(): Region {
+  #visibleRegion(): Region {
     const { cx, cy, zoom, viewW, viewH } = this.view;
     const { w, h } = this.img;
     const hw = viewW / zoom / 2;
@@ -242,7 +247,7 @@ export class Viewer {
     Recompute the extent histogram for the visible area. One computation in flight,
     latest view wins, at most one every REGION_INTERVAL_MS. Skipped if the region is unchanged.
   */
-  private async requestRegionExtent() {
+  async #requestRegionExtent() {
     const pipe = this.#pipe;
     if (!pipe || !this.ready) return;
     if (this.#regionBusy) {
@@ -253,7 +258,7 @@ export class Viewer {
     try {
       do {
         this.#regionDirty = false;
-        const r = this.visibleRegion();
+        const r = this.#visibleRegion();
         const key = `${r.x0},${r.y0},${r.x1},${r.y1}`;
         if (key !== this.#lastRegion) {
           this.#lastRegion = key;
@@ -308,6 +313,12 @@ export class Viewer {
   toggleActualSize(sx: number, sy: number) {
     if (Math.abs(this.view.zoom - 1) < 1e-3) this.fit();
     else this.zoomTo(sx, sy, 1);
+  }
+
+  setInterpolation(mode: Interpolation) {
+    this.interpolation = mode;
+    this.#pipe?.setInterpolation(mode);
+    this.requestDraw(); // display pass only: no re-render, no histogram work
   }
 
   // export

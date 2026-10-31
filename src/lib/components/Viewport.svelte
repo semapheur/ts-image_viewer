@@ -4,11 +4,13 @@
   import { getViewer } from "../contexts/viewer.svelte";
   import FilePicker from "./FilePicker.svelte";
   import Minimap from "./Minimap.svelte";
+  import { INTERPOLATIONS, type Interpolation } from "../interpolation";
 
   const viewer = getViewer();
 
   const PAN_STEP = 40; // px per arrow-key press
   const CLICK_SLOP = 4; // px of movement that turns a click into a drag
+  const MARKER_MIN = 10; // px: smallest outline drawn, so the pick stays visible when zoomed out
 
   interface Drag {
     startX: number;
@@ -53,7 +55,8 @@
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
   };
-  const onControl = (e: Event) => !!(e.target as Element).closest("button");
+  const onControl = (e: Event) =>
+    !!(e.target as Element).closest("button, select");
 
   function onWheel(e: WheelEvent) {
     if (!viewer.ready) return;
@@ -106,6 +109,7 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    if ((e.target as Element).closest("select, input, textarea")) return; // let controls keep their keys
     const cx = viewer.view.viewW / 2;
     const cy = viewer.view.viewH / 2;
     switch (e.key) {
@@ -179,6 +183,17 @@
     <div class="toolbar">
       <button onclick={() => viewer.fit()}>Fit</button>
       <button onclick={() => viewer.actualSize()}>100%</button>
+      <select
+        class="select"
+        title="Resample"
+        value={viewer.interpolation}
+        onchange={(e) =>
+          viewer.setInterpolation(e.currentTarget.value as Interpolation)}
+      >
+        {#each INTERPOLATIONS as m (m.id)}
+          <option value={m.id} title={m.hint}>{m.label}</option>
+        {/each}
+      </select>
       <output>{viewer.zoomPct}%</output>
     </div>
   {/if}
@@ -200,10 +215,18 @@
   {#if viewer.picked}
     {@const p = viewer.picked}
     {@const s = viewer.vs}
+    <!-- Outline of the picked pixel: exactly one image pixel at high zoom, a small box when zoomed out -->
+    {@const side = Math.max(s.zoom, MARKER_MIN)}
+    {@const midX = (p.x + 0.5 - s.cx) * s.zoom + s.w / 2}
+    {@const midY = (p.y + 0.5 - s.cy) * s.zoom + s.h / 2}
+    {@const stroke = side >= 72 ? 3 : side >= 24 ? 2 : 1}
     <div
       class="marker"
-      style:left="{(p.x + 0.5 - s.cx) * s.zoom + s.w / 2}px"
-      style:top="{(p.y + 0.5 - s.cy) * s.zoom + s.h / 2}px"
+      style:left="{midX - side / 2}px"
+      style:top="{midY - side / 2}px"
+      style:width="{side}px"
+      style:height="{side}px"
+      style:border-width="{stroke}px"
     ></div>
   {/if}
 </div>
@@ -247,12 +270,18 @@
   }
   .marker {
     position: absolute;
-    width: 14px;
-    height: 14px;
-    transform: translate(-50%, -50%);
-    border-radius: 50%;
-    border: 1.5px solid #fff;
-    box-shadow: 0 0 0 1.5px #000;
+    box-sizing: border-box; /* the white stroke sits inside the pixel's own footprint */
+    border: 1px solid #fff;
+    outline: 1px solid #000; /* dark outer edge keeps it visible on light areas */
     pointer-events: none;
+  }
+  .select {
+    flex: 1;
+    background: var(--well);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0.3rem 0.4rem;
+    font: inherit;
   }
 </style>

@@ -22,6 +22,7 @@
 
 <label class="row">
   <span>{label}</span>
+  <output>{value.toFixed(Number.isInteger(step) ? 0 : 2)}</output>
   <input
     type="range"
     {min}
@@ -31,13 +32,12 @@
     bind:value
     ondblclick={() => (value = neutral)}
   />
-  <output>{value.toFixed(Number.isInteger(step) ? 0 : 2)}</output>
 </label>
 
 <style>
   .row {
     display: grid;
-    grid-template-columns: 6.5rem 1fr 3rem;
+    grid-template-columns: 6rem 3rem 1fr;
     align-items: center;
     gap: 0.5rem;
     font-size: 0.85rem;
