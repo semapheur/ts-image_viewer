@@ -17,6 +17,7 @@
     step={s.step}
     neutral={s.neutral}
     {disabled}
+    curve={s.curve}
     bind:value={v[s.key]}
   />
 {/each}

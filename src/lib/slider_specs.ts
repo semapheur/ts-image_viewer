@@ -12,24 +12,27 @@ export interface SliderSpec {
   max: number;
   step?: number;
   neutral: number; // value restored by double-click
+  curve?: (x: number, value: number) => number;
 }
 
 export const TONE: SliderSpec[] = [
-  { key: "exposure", label: "Exposure (EV)", min: -4, max: 4, neutral: 0 },
+  { key: "exposure", label: "Exposure", min: -4, max: 4, neutral: 0 },
   { key: "brightness", label: "Brightness", min: -0.5, max: 0.5, neutral: 0 },
   { key: "contrast", label: "Contrast", min: 0, max: 2, neutral: 1 },
   { key: "saturation", label: "Saturation", min: 0, max: 2, neutral: 1 },
-  { key: "gamma", label: "Gamma", min: 0.2, max: 3, neutral: 1 },
+  {
+    key: "gamma",
+    label: "Gamma",
+    min: 0.1,
+    max: 5,
+    neutral: 1,
+    curve: (x, g) => x ** (1 / g),
+  },
 ];
 
 export const DETAIL: SliderSpec[] = [
   { key: "sharpen", label: "Sharpen", min: 0, max: 3, neutral: 0 },
   { key: "denoise", label: "Denoise", min: 0, max: 1, neutral: 0 },
-];
-
-export const HIST_RANGE: SliderSpec[] = [
-  { key: "histLo", label: "Range low", min: 0, max: 0.98, neutral: 0 },
-  { key: "histHi", label: "Range high", min: 0.02, max: 1, neutral: 1 },
 ];
 
 export const BIT_DEPTH: SliderSpec[] = [

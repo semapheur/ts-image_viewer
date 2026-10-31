@@ -50,7 +50,7 @@
   });
 
   // Clamp tooltip position within viewBox bounds so it never triggers container size changes or clipping
-  const tooltipX = $derived(clamp(handle.x, 85, VB_W - 85));
+  const tooltipX = $derived(clamp(handle.x, 75, VB_W - 75));
   const tooltipY = $derived(handle.y > 60 ? handle.y - 20 : handle.y + 24);
 
   function pointer(e: PointerEvent) {
@@ -171,7 +171,7 @@
 
       {#if hovering && !dragging}
         <g class="tooltip" transform="translate({tooltipX}, {tooltipY})">
-          <rect x="-82" y="-10" width="164" height="20" rx="3" />
+          <rect x="-70" y="-10" width="140" height="20" rx="3" />
           <text x="0" y="0">Sideways: Mid · Up/Down: Contrast</text>
         </g>
       {/if}
@@ -266,13 +266,13 @@
     pointer-events: none;
   }
   .tooltip rect {
-    fill: var(--ink);
+    fill: var(--bg);
     stroke: var(--edge);
     stroke-width: 1px;
     vector-effect: non-scaling-stroke;
   }
   .tooltip text {
-    fill: var(--well);
+    fill: var(--ink);
     font-size: 8.5px;
     font-family: inherit;
     text-anchor: middle;
@@ -295,10 +295,10 @@
     font-variant-numeric: tabular-nums;
   }
   .contrast-num {
-    width: 5ch; /* Allocates exact horizontal space for up to 5 character widths (e.g., 100.0) */
+    width: 5ch;
   }
   .mid-num {
-    width: 4ch; /* Allocates exact horizontal space for 4 character widths (e.g., 0.50) */
+    width: 4ch;
   }
   .off-label {
     visibility: hidden;

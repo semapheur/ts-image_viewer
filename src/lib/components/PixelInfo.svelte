@@ -46,23 +46,22 @@
     </figure>
   </div>
 
-  <table>
-    <thead
-      ><tr><th></th><th>Original</th><th>Adjusted</th><th>0–1</th></tr></thead
-    >
-    <tbody>
-      {#each rows as ch, i}
-        <tr>
-          <th scope="row">{ch}</th>
-          <td>{byte(original[i])}</td>
-          <td>{byte(adjusted[i])}</td>
-          <td>{adjusted[i].toFixed(3)}</td>
-        </tr>
-      {/each}
-    </tbody>
-  </table>
-
   <dl>
+    <dt class="rgb-label">RGB</dt>
+    <dd>
+      {byte(adjusted[0])}, {byte(adjusted[1])}, {byte(adjusted[2])} / {adjusted[0].toFixed(
+        3,
+      )},
+      {adjusted[1].toFixed(3)},
+      {adjusted[2].toFixed(3)}
+    </dd>
+    <dd class="muted">
+      (was {byte(original[0])}, {byte(original[1])}, {byte(original[2])} / {original[0].toFixed(
+        3,
+      )},
+      {original[1].toFixed(3)},
+      {original[2].toFixed(3)})
+    </dd>
     <dt>Hex</dt>
     <dd>{hex(adjusted)} <span class="muted">(was {hex(original)})</span></dd>
     <dt>HSL</dt>
@@ -98,24 +97,6 @@
     font-size: 0.75rem;
     margin-top: 0.15rem;
   }
-  table {
-    border-collapse: collapse;
-    width: 100%;
-    font-variant-numeric: tabular-nums;
-  }
-  th,
-  td {
-    text-align: right;
-    padding: 0.15rem 0.25rem;
-    font-weight: 400;
-  }
-  thead th {
-    color: var(--muted);
-    font-size: 0.75rem;
-  }
-  tbody th {
-    text-align: left;
-  }
   dl {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -129,5 +110,9 @@
   dd {
     margin: 0;
     font-variant-numeric: tabular-nums;
+  }
+  .rgb-label {
+    grid-row: span 2;
+    align-self: start;
   }
 </style>

@@ -1,10 +1,9 @@
 <script lang="ts">
   import Panel from "./Panel.svelte";
-  import ParamSliders from "./ParamSliders.svelte";
+  import RangeSlider from "./RangeSlider.svelte";
   import Histogram from "./Histogram.svelte";
   import { getParams } from "../contexts/params.svelte";
   import { getViewer } from "../contexts/viewer.svelte";
-  import { HIST_RANGE } from "../slider_specs";
 
   const viewer = getViewer();
   const { values: v } = getParams();
@@ -33,7 +32,7 @@
       />
     {/each}
   </div>
-  <ParamSliders specs={HIST_RANGE} />
+  <RangeSlider label="Range" bind:lo={v.histLo} bind:hi={v.histHi} />
   <label class="check">
     <input type="checkbox" bind:checked={logScale} /> Logarithmic counts
   </label>
