@@ -166,8 +166,8 @@
       onpointerleave={() => (hovering = false)}
     >
       <circle class="hit" cx={handle.x} cy={handle.y} r={HIT} />
-      <circle class="halo" cx={handle.x} cy={handle.y} r="10" />
-      <circle class="handle" cx={handle.x} cy={handle.y} r="6" />
+      <circle class="halo" cx={handle.x} cy={handle.y} r="6" />
+      <circle class="handle" cx={handle.x} cy={handle.y} r="4" />
 
       {#if hovering && !dragging}
         <g class="tooltip" transform="translate({tooltipX}, {tooltipY})">

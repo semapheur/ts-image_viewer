@@ -2,6 +2,7 @@
   import "./app.css";
   import { Params, setParams } from "./lib/contexts/params.svelte";
   import { Viewer, setViewer } from "./lib/contexts/viewer.svelte";
+  import { Convolution, setConv } from "./lib/contexts/convolution.svelte";
   import { DETAIL, TONE } from "./lib/slider_specs";
   import Viewport from "./lib/components/Viewport.svelte";
   import FilePicker from "./lib/components/FilePicker.svelte";
@@ -11,10 +12,13 @@
   import StretchPanel from "./lib/components/StretchPanel.svelte";
   import SigmoidPanel from "./lib/components/SigmoidPanel.svelte";
   import OutputPanel from "./lib/components/OutputPanel.svelte";
+  import ConvolutionPanel from "./lib/components/ConvolutionPanel.svelte";
 
   const params = new Params();
   setParams(params);
-  const viewer = new Viewer(params);
+  const conv = new Convolution();
+  setConv(conv);
+  const viewer = new Viewer(params, conv);
   setViewer(viewer);
 </script>
 
@@ -29,12 +33,6 @@
 
 <main>
   <aside>
-    <SliderPanel title="Tone" specs={TONE} />
-    <SigmoidPanel />
-    <StretchPanel />
-    <SliderPanel title="Detail" specs={DETAIL} />
-    <OutputPanel />
-
     <div class="actions">
       <button onclick={params.reset}>Reset all</button>
       <FilePicker
@@ -45,6 +43,12 @@
         Open another image
       </FilePicker>
     </div>
+    <OutputPanel />
+    <SliderPanel title="Tone" specs={TONE} />
+    <SigmoidPanel />
+    <StretchPanel />
+    <SliderPanel title="Detail" specs={DETAIL} />
+    <ConvolutionPanel />
   </aside>
   <Viewport />
 

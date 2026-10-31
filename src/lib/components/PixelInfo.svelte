@@ -1,37 +1,29 @@
 <script lang="ts">
-  import type { RGB } from "../types";
+  import { srgbToHsl, srgbToOklch, type RGB } from "../color";
 
   interface Props {
     x: number;
     y: number;
     adjusted: RGB;
     original: RGB;
+    maxValue?: number;
   }
-  let { x, y, adjusted, original }: Props = $props();
+  let { x, y, adjusted, original, maxValue = 255 }: Props = $props();
 
+  const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
   const byte = (v: number) => Math.round(Math.min(1, Math.max(0, v)) * 255);
+  const level = (v: number) => Math.round(clamp01(v) * maxValue);
   const hex = (c: RGB) =>
     "#" + c.map((v) => byte(v).toString(16).padStart(2, "0")).join("");
 
-  function hsl(c: RGB): [number, number, number] {
-    const [r, g, b] = c.map((v) => Math.min(1, Math.max(0, v)));
-    const max = Math.max(r, g, b),
-      min = Math.min(r, g, b),
-      d = max - min;
-    const l = (max + min) / 2;
-    if (d === 0) return [0, 0, l * 100];
-    const s = d / (1 - Math.abs(2 * l - 1));
-    const h =
-      max === r
-        ? ((g - b) / d) % 6
-        : max === g
-          ? (b - r) / d + 2
-          : (r - g) / d + 4;
-    return [(h * 60 + 360) % 360, s * 100, l * 100];
-  }
+  const deg = (h: number | null) => (h === null ? "—" : `${h.toFixed(1)}°`);
+  const pct = (v: number) => `${(v * 100).toFixed(1)}%`;
 
-  const rows = ["R", "G", "B"] as const;
-  const adjHsl = $derived(hsl(adjusted));
+  const hslAdjusted = $derived(srgbToHsl(adjusted));
+  const hslOriginal = $derived(srgbToHsl(original));
+
+  const oklchAdjusted = $derived(srgbToOklch(adjusted));
+  const oklchOriginal = $derived(srgbToOklch(original));
 </script>
 
 <div class="pixel">
@@ -47,28 +39,42 @@
   </div>
 
   <dl>
-    <dt class="rgb-label">RGB</dt>
+    <dt class="rgb-label" title="Red, Green, Blue">RGB</dt>
     <dd>
-      {byte(adjusted[0])}, {byte(adjusted[1])}, {byte(adjusted[2])} / {adjusted[0].toFixed(
-        3,
-      )},
+      {String(level(adjusted[0]))}, {String(level(adjusted[1]))}, {String(
+        level(adjusted[2]),
+      )} / {adjusted[0].toFixed(3)},
       {adjusted[1].toFixed(3)},
       {adjusted[2].toFixed(3)}
     </dd>
     <dd class="muted">
-      (was {byte(original[0])}, {byte(original[1])}, {byte(original[2])} / {original[0].toFixed(
-        3,
-      )},
+      (was {String(level(original[0]))}, {String(level(original[1]))}, {String(
+        level(original[2]),
+      )} / {original[0].toFixed(3)},
       {original[1].toFixed(3)},
       {original[2].toFixed(3)})
     </dd>
     <dt>Hex</dt>
     <dd>{hex(adjusted)} <span class="muted">(was {hex(original)})</span></dd>
-    <dt>HSL</dt>
+    <dt title="Hue, Saturation, Lighness">HSL</dt>
     <dd>
-      {adjHsl[0].toFixed(0)}°, {adjHsl[1].toFixed(0)}%, {adjHsl[2].toFixed(0)}%
+      {deg(hslAdjusted.h)}, {pct(hslAdjusted.s)}, {pct(hslAdjusted.l)}
+      <span class="muted">
+        (was {deg(hslOriginal.h)}, {pct(hslOriginal.s)}, {pct(hslOriginal.l)})
+      </span>
     </dd>
-    <dt>Position</dt>
+    <dt title="Lightness, Chroma, Hue">OKLCH</dt>
+    <dd>
+      {pct(oklchAdjusted.l)}, {oklchAdjusted.c.toFixed(3)}, {deg(
+        oklchAdjusted.h,
+      )}
+      <span class="muted">
+        (was {pct(oklchOriginal.l)}, {oklchOriginal.c.toFixed(3)}, {deg(
+          oklchOriginal.h,
+        )})
+      </span>
+    </dd>
+    <dt>Position (x, y)</dt>
     <dd>{x}, {y}</dd>
   </dl>
 </div>

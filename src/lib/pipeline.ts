@@ -1,12 +1,13 @@
-/*
-  GPU pipeline (Three.js WebGPURenderer + TSL)
-
-  source ─► A: bilateral denoise ─► RT_A (linear, half-float)
-  RT_A   ─► B: sharpen ─► sRGB encode ─► band stretch ─► exposure ─► tone chain ─► RT_B
-  RT_B   ─► C: zoom/pan display quad ─► canvas
-  RT_B   ─► D: compute: atomicAdd histogram ─► storage buffer ─► CPU
-  source ─► E: compute: fine "extent" histogram (once per image, drives auto stretch)
-  RT_B/source ─► F: compute: single-pixel picker
+/**
+ * GPU pipeline (Three.js WebGPURenderer + TSL)
+ *
+ *   source ─► A: bilateral denoise ─► RT_A (linear, half-float)
+ *   RT_A   ─► [convolution chain, ping-pong RT_P / RT_Q, one pass per filter] ─► RT_chain
+ *   RT_chain ─► B: sharpen ─► sRGB encode ─► band stretch ─► exposure ─► tone chain ─► RT_B
+ *   RT_B   ─► C: zoom/pan display quad ─► canvas
+ *   RT_B   ─► D: compute: atomicAdd histogram ─► storage buffer ─► CPU
+ *   source ─► E: compute: fine "extent" histogram (once per image, drives auto stretch)
+ *   RT_B/source ─► F: compute: single-pixel picker
  */
 import * as THREE from "three/webgpu";
 import {
@@ -28,6 +29,7 @@ import {
   exp,
   log,
   sqrt,
+  sin,
   pow,
   max,
   min,
@@ -35,11 +37,12 @@ import {
   dot,
   step,
   clamp,
-  sin,
 } from "three/tsl";
 import type { ParamValues } from "./contexts/params.svelte";
 import type { Interpolation } from "./interpolation";
-import type { RGB } from "./types";
+import type { ConvSnapshot, ConvStep } from "./convolution";
+
+export type RGB = [number, number, number];
 
 /**
  * A high-bit-depth source: linear-light RGBA floats in 0..1, row 0 = top.
@@ -53,7 +56,16 @@ export interface DeepImage {
 }
 const isDeep = (s: ImageBitmap | DeepImage): s is DeepImage => "data" in s;
 
-// Rectangle in image pixels (y down): x0,y0 inclusive, x1,y1 exclusive.
+/** One pass of the convolution chain, with its own editable weights. */
+interface ConvSlot {
+  quad: THREE.QuadMesh;
+  out: THREE.RenderTarget;
+  weights: any[]; // one uniform per kernel cell
+  bias: any;
+  amount: any;
+}
+
+/** Rectangle in image pixels (y down): x0,y0 inclusive, x1,y1 exclusive. */
 export interface Region {
   x0: number;
   y0: number;
@@ -61,7 +73,7 @@ export interface Region {
   y1: number;
 }
 
-export const EBINS = 4096;
+export const EBINS = 4096; // fine enough for percentiles on 16-bit data
 export const BINS = 256;
 export const CHANNELS = 4; // R, G, B, luma
 
@@ -71,7 +83,7 @@ export class Pipeline {
   renderer!: THREE.WebGPURenderer;
 
   // One uniform per parameter, updated without rebuilding shaders.
-  #u = {
+  private u = {
     exposure: uniform(0),
     brightness: uniform(0),
     contrast: uniform(1),
@@ -97,7 +109,7 @@ export class Pipeline {
   };
 
   // View (zoom/pan) uniforms
-  #v = {
+  private v = {
     zoom: uniform(1),
     cx: uniform(0),
     cy: uniform(0),
@@ -105,41 +117,57 @@ export class Pipeline {
     vh: uniform(1),
   };
 
-  #src?: THREE.Texture;
-  #rtA?: THREE.RenderTarget;
-  #rtB?: THREE.RenderTarget;
-  #quads: THREE.QuadMesh[] = [];
-  #interpolation: Interpolation = "bilinear";
-  #displayQuads = new Map<Interpolation, THREE.QuadMesh>();
-  #makeDisplay?: (mode: Interpolation) => THREE.QuadMesh;
+  private src?: THREE.Texture;
+  private rtA?: THREE.RenderTarget;
+  private rtB?: THREE.RenderTarget;
+  // Convolution chain: ping-pong targets are created only when the chain needs them.
+  private rtP?: THREE.RenderTarget;
+  private rtQ?: THREE.RenderTarget;
+  private convSnap: ConvSnapshot = { key: "", steps: [] };
+  private convKey = "";
+  private convSteps: ConvSlot[] = [];
+  private convOut?: THREE.RenderTarget; // what the tone pass reads
+  private tonalQuads = new Map<THREE.RenderTarget, THREE.QuadMesh>(); // one tone pass per possible input
+  private makeRT?: () => THREE.RenderTarget;
+  private makeTonal?: (input: THREE.RenderTarget) => THREE.QuadMesh;
+  private makeConv?: (
+    input: THREE.RenderTarget,
+    out: THREE.RenderTarget,
+    step: ConvStep,
+  ) => ConvSlot;
+  private quads: THREE.QuadMesh[] = []; // [denoise]
+  private interp: Interpolation = "bilinear";
+  private displayQuads = new Map<Interpolation, THREE.QuadMesh>();
+  private makeDisplay?: (mode: Interpolation) => THREE.QuadMesh;
 
-  #histNode?: any;
-  #clearPass?: any;
-  #accumPass?: any;
+  private histNode?: any;
+  private clearPass?: any;
+  private accumPass?: any;
 
-  #pick = { x: uniform(0), y: uniform(0) };
-  #pickPass?: any;
-  #pickOut?: any;
+  private pick = { x: uniform(0), y: uniform(0) };
+  private pickPass?: any;
+  private pickOut?: any;
 
-  #extentNode?: any;
-  #extentClear?: any;
-  #extentAccum?: any;
+  private extentNode?: any;
+  private extentClear?: any;
+  private extentAccum?: any;
   // Region the extent histogram is restricted to (image pixels).
-  #region = {
+  private region = {
     x0: uniform(0, "uint"),
     y0: uniform(0, "uint"),
     w: uniform(1, "uint"),
     count: uniform(1, "uint"),
   };
-  #imgW = 0;
-  #imgH = 0;
-  #deepPath = false;
+  private imgW = 0;
+  private imgH = 0;
+  private deepPath = false;
+  /** GPU can filter and render float32 targets, which the 16-bit path needs. */
   hasFloat32 = false;
 
   async init(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGPURenderer({ canvas, antialias: false });
     await this.renderer.init();
-    const device = this.renderer.backend?.device;
+    const device = (this.renderer as any).backend?.device;
     this.hasFloat32 = !!device?.features?.has("float32-filterable");
     // RT_B already holds sRGB-encoded values, so don't encode again on output.
     this.renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
@@ -148,61 +176,62 @@ export class Pipeline {
 
   resize(cssW: number, cssH: number) {
     this.renderer.setSize(cssW, cssH, false);
-    this.#v.vw.value = cssW;
-    this.#v.vh.value = cssH;
+    this.v.vw.value = cssW;
+    this.v.vh.value = cssH;
   }
 
   setParams(p: ParamValues) {
-    for (const k in this.#u) (this.#u as any)[k].value = (p as any)[k];
+    for (const k in this.u) (this.u as any)[k].value = (p as any)[k];
   }
 
   setView(cx: number, cy: number, zoom: number) {
-    this.#v.cx.value = cx;
-    this.#v.cy.value = cy;
-    this.#v.zoom.value = zoom;
+    this.v.cx.value = cx;
+    this.v.cy.value = cy;
+    this.v.zoom.value = zoom;
   }
 
+  /** Choose how the image is resampled on screen. Takes effect on the next draw. */
   setInterpolation(mode: Interpolation) {
-    this.#interpolation = mode;
+    this.interp = mode;
   }
 
-  #displayQuad(): THREE.QuadMesh | undefined {
-    let q = this.#displayQuads.get(this.#interpolation);
-    if (!q && this.#makeDisplay) {
-      q = this.#makeDisplay(this.#interpolation);
-      this.#displayQuads.set(this.#interpolation, q);
+  private displayQuad(): THREE.QuadMesh | undefined {
+    let q = this.displayQuads.get(this.interp);
+    if (!q && this.makeDisplay) {
+      q = this.makeDisplay(this.interp);
+      this.displayQuads.set(this.interp, q);
     }
     return q;
   }
 
-  // Cheap redraw for pan/zoom: display pass only.
+  /** Cheap redraw for pan/zoom: display pass only. */
   drawView() {
-    const q = this.#displayQuad();
+    const q = this.displayQuad();
     if (!q) return;
     this.renderer.setRenderTarget(null);
     q.render(this.renderer);
   }
 
-  // (Re)build all GPU resources for a new image.
+  /** (Re)build all GPU resources for a new image. */
   setImage(source: ImageBitmap | DeepImage) {
-    this.#disposeImage();
+    this.disposeImage();
     const deep = isDeep(source);
     if (deep && !this.hasFloat32) {
       throw new Error(
         'The 16-bit path needs the WebGPU "float32-filterable" feature.',
       );
     }
-    this.#deepPath = deep;
-    const w = source.width;
-    const h = source.height;
-    this.#imgW = w;
-    this.#imgH = h;
-    const u = this.#u;
+    this.deepPath = deep;
+    const w = source.width,
+      h = source.height;
+    this.imgW = w;
+    this.imgH = h;
+    const u = this.u;
 
     let src: THREE.Texture;
     if (isDeep(source)) {
-      // Already linear light, so no colour-space conversion is wanted. Same memory layout as an uploaded bitmap (row 0 = top), so pass A's flip still applies.
-
+      // Already linear light, so no colour-space conversion is wanted. Same memory
+      // layout as an uploaded bitmap (row 0 = top), so pass A's flip still applies.
       src = new THREE.DataTexture(
         source.data,
         w,
@@ -218,11 +247,13 @@ export class Pipeline {
     src.minFilter = src.magFilter = THREE.LinearFilter;
     src.generateMipmaps = false;
     src.needsUpdate = true;
-    this.#src = src;
+    this.src = src;
 
+    // 16-bit path: float32 targets keep every level. 8-bit path: half-float is plenty.
     const rtType = deep ? THREE.FloatType : THREE.HalfFloatType;
-    const quantizeBelow = deep ? 16.5 : 15.5;
-
+    // Bit depths below this quantise. With float32 storage 16 bits is a real setting;
+    // with half-float it can't be resolved, so it means "off".
+    const quantiseBelow = deep ? 16.5 : 15.5;
     const makeRT = () =>
       new THREE.RenderTarget(w, h, {
         type: rtType,
@@ -231,11 +262,12 @@ export class Pipeline {
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,
       });
-    const rtA = (this.#rtA = makeRT());
-    const rtB = (this.#rtB = makeRT());
+    const rtA = (this.rtA = makeRT());
+    const rtB = (this.rtB = makeRT());
+    this.makeRT = makeRT;
     const texel = vec2(1 / w, 1 / h);
 
-    // colour helpers
+    // ---------- colour helpers ----------
     const srgbEncode = (x: any) => {
       const xc = max(x, 0);
       const hi = pow(max(xc, 0.0031308), 1 / 2.4)
@@ -250,7 +282,7 @@ export class Pipeline {
     };
     const sigmoid = (x: any) => float(1).div(float(1).add(exp(x.negate())));
 
-    // Pass A: bilateral denoise (5x5, unrolled)
+    // ---------- Pass A: bilateral denoise (5x5, unrolled) ----------
     const denoise = Fn(() => {
       // vertical flip applied once, here, when reading the source
       const c = vec2(uv().x, float(1).sub(uv().y));
@@ -273,97 +305,99 @@ export class Pipeline {
       return vec4(mix(center, acc.div(wsum), u.denoise), 1);
     });
 
-    // Pass B: sharpen, stretch, tone chain
-    const tonal = Fn(() => {
-      const c = uv();
-      const tap = (dx: number, dy: number) =>
-        texture(rtA.texture, c.add(vec2(dx, dy).mul(texel))).rgb;
+    // ---------- Pass B: sharpen, stretch, tone chain ----------
+    // Built per input target: the convolution chain decides which render target this reads.
+    const buildTonal = (input: THREE.RenderTarget) =>
+      Fn(() => {
+        const c = uv();
+        const tap = (dx: number, dy: number) =>
+          texture(input.texture, c.add(vec2(dx, dy).mul(texel))).rgb;
 
-      // unsharp mask in linear light (3x3 gaussian)
-      const kern = [
-        [1, 2, 1],
-        [2, 4, 2],
-        [1, 2, 1],
-      ];
-      let blur: any = vec3(0);
-      for (let j = 0; j < 3; j++)
-        for (let i = 0; i < 3; i++)
-          blur = blur.add(tap(i - 1, j - 1).mul(kern[j][i] / 16));
-      const center = tap(0, 0);
-      const sharpened: any = center.add(center.sub(blur).mul(u.sharpen));
+        // unsharp mask in linear light (3x3 gaussian)
+        const kern = [
+          [1, 2, 1],
+          [2, 4, 2],
+          [1, 2, 1],
+        ];
+        let blur: any = vec3(0);
+        for (let j = 0; j < 3; j++)
+          for (let i = 0; i < 3; i++)
+            blur = blur.add(tap(i - 1, j - 1).mul(kern[j][i] / 16));
+        const center = tap(0, 0);
+        const sharpened: any = center.add(center.sub(blur).mul(u.sharpen));
 
-      // go display-referred
-      let v: any = srgbEncode(sharpened);
+        // go display-referred
+        let v: any = srgbEncode(sharpened);
 
-      // per-band stretch (before exposure, so auto ranges from the source stay valid)
-      const black = vec3(u.blackR, u.blackG, u.blackB);
-      const white = vec3(u.whiteR, u.whiteG, u.whiteB);
-      const t = clamp(v.sub(black).div(max(white.sub(black), 0.001)), 0, 1);
+        // ---- per-band stretch (before exposure, so auto ranges from the source stay valid) ----
+        const black = vec3(u.blackR, u.blackG, u.blackB);
+        const white = vec3(u.whiteR, u.whiteG, u.whiteB);
+        const t = clamp(v.sub(black).div(max(white.sub(black), 0.001)), 0, 1);
 
-      const strength = max(u.curveStrength, 0.01);
-      const mid = u.midtone;
-      // midtone transfer function: maps input level `mid` to 0.5 (0.5 = identity)
-      const mtf = mid.sub(1).mul(t).div(mid.mul(2).sub(1).mul(t).sub(mid));
-      const logC = log(float(1).add(strength.mul(t))).div(
-        log(float(1).add(strength)),
-      );
-      const asinhOf = (x: any) => log(x.add(sqrt(x.mul(x).add(1))));
-      const asinhC = asinhOf(strength.mul(t)).div(asinhOf(strength));
-
-      // pick the curve with 0/1 masks (every branch stays finite for t in [0,1])
-      const isMode = (i: number) =>
-        step(float(i - 0.5), u.stretchMode).mul(
-          step(u.stretchMode, float(i + 0.5)),
+        const strength = max(u.curveStrength, 0.01);
+        const mid = u.midtone;
+        // midtone transfer function: maps input level `mid` to 0.5 (0.5 = identity)
+        const mtf = mid.sub(1).mul(t).div(mid.mul(2).sub(1).mul(t).sub(mid));
+        const logC = log(float(1).add(strength.mul(t))).div(
+          log(float(1).add(strength)),
         );
-      v = t
-        .mul(isMode(0))
-        .add(mtf.mul(isMode(1)))
-        .add(logC.mul(isMode(2)))
-        .add(asinhC.mul(isMode(3)))
-        .add(sqrt(t).mul(isMode(4)));
+        const asinhOf = (x: any) => log(x.add(sqrt(x.mul(x).add(1))));
+        const asinhC = asinhOf(strength.mul(t)).div(asinhOf(strength));
 
-      // exposure in linear light (decode -> scale -> encode)
-      v = srgbEncode(srgbDecode(v).mul(pow(float(2), u.exposure)));
+        // pick the curve with 0/1 masks (every branch stays finite for t in [0,1])
+        const isMode = (i: number) =>
+          step(float(i - 0.5), u.stretchMode).mul(
+            step(u.stretchMode, float(i + 0.5)),
+          );
+        v = t
+          .mul(isMode(0))
+          .add(mtf.mul(isMode(1)))
+          .add(logC.mul(isMode(2)))
+          .add(asinhC.mul(isMode(3)))
+          .add(sqrt(t).mul(isMode(4)));
 
-      // brightness / contrast
-      v = v.add(u.brightness);
-      v = v.sub(0.5).mul(u.contrast).add(0.5);
-      // saturation (Rec.709 luma)
-      const lum = dot(v, vec3(LUMA[0], LUMA[1], LUMA[2]));
-      v = mix(vec3(lum), v, u.saturation);
-      // gamma
-      v = pow(max(v, 0), float(1).div(max(u.gamma, 0.01)));
-      // sigmoidal contrast (ImageMagick formulation); identity when amount ~ 0
-      const amount = max(u.sigmoidAmount, 0.01);
-      const sMid = u.sigmoidMid;
-      const sLo = sigmoid(amount.mul(sMid).negate());
-      const sHi = sigmoid(amount.mul(float(1).sub(sMid)));
-      const sig = sigmoid(amount.mul(v.sub(sMid)))
-        .sub(sLo)
-        .div(sHi.sub(sLo));
-      v = mix(v, sig, step(0.01, u.sigmoidAmount));
+        // exposure in linear light (decode -> scale -> encode)
+        v = srgbEncode(srgbDecode(v).mul(pow(float(2), u.exposure)));
 
-      // bit depth: quantise each band to 2^bit levels (display deferred values)
-      v = clamp(v, 0, 1);
-      const levels = pow(float(2), u.bitDepth).sub(1);
-      // Interleaved-gradient noise anchored to image pixels, so it is stable under zoom/pan.
-      const px = uv().mul(vec2(w, h)).floor();
-      const noise = dot(px, vec2(0.06711056, 0.00583715))
-        .fract()
-        .mul(52.9829189)
-        .fract();
-      const jitter = noise.sub(0.5).mul(u.dither); // same offset for all bands: no colour noise
-      const quantised = clamp(
-        v.mul(levels).add(0.5).add(jitter).floor().div(levels),
-        0,
-        1,
-      );
-      v = mix(v, quantised, step(u.bitDepth, float(quantizeBelow)));
+        // brightness / contrast
+        v = v.add(u.brightness);
+        v = v.sub(0.5).mul(u.contrast).add(0.5);
+        // saturation (Rec.709 luma)
+        const lum = dot(v, vec3(LUMA[0], LUMA[1], LUMA[2]));
+        v = mix(vec3(lum), v, u.saturation);
+        // gamma
+        v = pow(max(v, 0), float(1).div(max(u.gamma, 0.01)));
+        // sigmoidal contrast (ImageMagick formulation); identity when amount ~ 0
+        const amount = max(u.sigmoidAmount, 0.01);
+        const sMid = u.sigmoidMid;
+        const sLo = sigmoid(amount.mul(sMid).negate());
+        const sHi = sigmoid(amount.mul(float(1).sub(sMid)));
+        const sig = sigmoid(amount.mul(v.sub(sMid)))
+          .sub(sLo)
+          .div(sHi.sub(sLo));
+        v = mix(v, sig, step(0.01, u.sigmoidAmount));
 
-      return vec4(v, 1);
-    });
+        // ---- bit depth: quantise each band to 2^bits levels (display-referred values) ----
+        v = clamp(v, 0, 1);
+        const levels = pow(float(2), u.bitDepth).sub(1);
+        // Interleaved-gradient noise anchored to image pixels, so it is stable under zoom/pan.
+        const px = uv().mul(vec2(w, h)).floor();
+        const noise = dot(px, vec2(0.06711056, 0.00583715))
+          .fract()
+          .mul(52.9829189)
+          .fract();
+        const jitter = noise.sub(0.5).mul(u.dither); // same offset for all bands: no colour noise
+        const quantised = clamp(
+          v.mul(levels).add(0.5).add(jitter).floor().div(levels),
+          0,
+          1,
+        );
+        v = mix(v, quantised, step(u.bitDepth, float(quantiseBelow)));
 
-    // Pass C: zoom/pan display
+        return vec4(v, 1);
+      });
+
+    // ---------- Pass C: zoom/pan display (resampling method chosen at draw time) ----------
     const BG = vec3(34 / 255, 37 / 255, 42 / 255); // matches --well
 
     // Colour of image texel (px, py), read at its exact centre so the sampler can't blend it.
@@ -447,7 +481,7 @@ export class Pipeline {
 
     const buildDisplay = (mode: Interpolation) =>
       Fn(() => {
-        const view = this.#v;
+        const view = this.v;
         // screen position in CSS px, y down
         const sx = uv().x.mul(view.vw);
         const sy = uv().y.mul(view.vh);
@@ -462,7 +496,8 @@ export class Pipeline {
         return vec4(mix(BG, col, inside), 1);
       });
 
-    this.#makeDisplay = (mode) => {
+    // Display materials are compiled lazily, the first time each method is used.
+    this.makeDisplay = (mode) => {
       const mat = new THREE.NodeMaterial();
       mat.fragmentNode = buildDisplay(mode)();
       return new THREE.QuadMesh(mat);
@@ -470,23 +505,64 @@ export class Pipeline {
 
     const matA = new THREE.NodeMaterial();
     matA.fragmentNode = denoise();
-    const matB = new THREE.NodeMaterial();
-    matB.fragmentNode = tonal();
-    const matC = new THREE.NodeMaterial();
-    this.#quads = [matA, matB, matC].map((m) => new THREE.QuadMesh(m));
+    this.quads = [new THREE.QuadMesh(matA)];
 
-    // Pass D: display histogram
+    this.makeTonal = (input) => {
+      const mat = new THREE.NodeMaterial();
+      mat.fragmentNode = buildTonal(input)();
+      return new THREE.QuadMesh(mat);
+    };
+
+    // ---------- Convolution chain: one full-screen pass per filter ----------
+    // The kernel is a set of uniforms, so editing weights never recompiles a shader.
+    this.makeConv = (input, out, st) => {
+      const size = st.size;
+      const radius = (size - 1) / 2;
+      const weights = Array.from({ length: size * size }, () => uniform(0));
+      const bias = uniform(0);
+      const amount = uniform(1);
+
+      const mat = new THREE.NodeMaterial();
+      mat.fragmentNode = Fn(() => {
+        const c = uv();
+        const read = (dx: number, dy: number) => {
+          const s = texture(input.texture, c.add(vec2(dx, dy).mul(texel))).rgb;
+          return st.encodeIn ? srgbEncode(s) : s;
+        };
+        const center = read(0, 0);
+        let acc: any = vec3(0);
+        for (let j = 0; j < size; j++) {
+          for (let i = 0; i < size; i++) {
+            acc = acc.add(
+              read(i - radius, j - radius).mul(weights[j * size + i]),
+            );
+          }
+        }
+        let res: any = acc.add(bias);
+        if (st.abs) res = res.abs();
+        let color: any = mix(center, res, amount);
+        if (st.decodeOut) color = srgbDecode(color);
+        return vec4(color, 1);
+      })();
+      return { quad: new THREE.QuadMesh(mat), out, weights, bias, amount };
+    };
+
+    // Targets and passes depend on the image size, so build them for this image.
+    this.rebuildConv();
+    this.applyConvValues();
+
+    // ---------- Pass D: display histogram ----------
     const total = w * h;
     const histNode = instancedArray(BINS * CHANNELS, "uint");
     const hist = histNode.toAtomic();
-    this.#histNode = histNode;
+    this.histNode = histNode;
 
-    this.#clearPass = Fn(() => {
+    this.clearPass = Fn(() => {
       atomicStore(hist.element(instanceIndex), uint(0));
     })().compute(BINS * CHANNELS);
 
     const pixels = texture(rtB.texture);
-    this.#accumPass = Fn(() => {
+    this.accumPass = Fn(() => {
       If(instanceIndex.lessThan(uint(total)), () => {
         const x = instanceIndex.mod(uint(w));
         const y = instanceIndex.div(uint(w));
@@ -508,23 +584,24 @@ export class Pipeline {
       });
     })().compute(total);
 
-    // Pass E: extent histogram of the source (once per image)
+    // ---------- Pass E: extent histogram of the source (once per image) ----------
     const extNode = instancedArray(EBINS * CHANNELS, "uint");
     const ext = extNode.toAtomic();
-    this.#extentNode = extNode;
+    this.extentNode = extNode;
 
-    this.#extentClear = Fn(() => {
+    this.extentClear = Fn(() => {
       atomicStore(ext.element(instanceIndex), uint(0));
     })().compute(EBINS * CHANNELS);
 
     // Only pixels inside `region` are counted. Threads beyond region.count exit at once.
-    const region = this.#region;
-    this.#extentAccum = Fn(() => {
+    const region = this.region;
+    this.extentAccum = Fn(() => {
       If(instanceIndex.lessThan(region.count), () => {
         const x = region.x0.add(instanceIndex.mod(region.w)).toFloat();
         const y = region.y0.add(instanceIndex.div(region.w)).toFloat();
         const p = vec2(x.add(0.5).div(w), y.add(0.5).div(h));
-        // (x, y) is in the display convention (y down), so undo pass A's vertical flip when reading the source, exactly like the pixel picker does.
+        // (x, y) is in the display convention (y down), so undo pass A's vertical
+        // flip when reading the source, exactly like the pixel picker does.
         const c = clamp(
           srgbEncode(texture(src, vec2(p.x, float(1).sub(p.y))).level(0).rgb),
           0,
@@ -542,15 +619,15 @@ export class Pipeline {
       });
     })().compute(total);
 
-    // Pass F: pixel picker
+    // ---------- Pass F: pixel picker ----------
     const pickOut = instancedArray(8, "float"); // [adj r,g,b,_, orig r,g,b,_]
-    this.#pickOut = pickOut;
-    this.#pickPass = Fn(() => {
+    this.pickOut = pickOut;
+    this.pickPass = Fn(() => {
       If(instanceIndex.equal(uint(0)), () => {
         // pixel centre in the same (u, v) convention the display pass samples with
         const p = vec2(
-          this.#pick.x.add(0.5).div(w),
-          this.#pick.y.add(0.5).div(h),
+          this.pick.x.add(0.5).div(w),
+          this.pick.y.add(0.5).div(h),
         );
         const adj = texture(rtB.texture, p).level(0).rgb;
         // original: undo the vertical flip pass A applies when reading the source
@@ -567,23 +644,23 @@ export class Pipeline {
     })().compute(1);
   }
 
-  /*
-    Fine histogram of the source image: 4 * EBINS counts (R, G, B, luma).
-    Pass a region (image pixels) to restrict it, e.g. to the visible area; default is the whole image.
-  */
+  /**
+   * Fine histogram of the source image: 4 * EBINS counts (R, G, B, luma).
+   * Pass a region (image pixels) to restrict it, e.g. to the visible area; default is the whole image.
+   */
   async computeExtent(r?: Region): Promise<Uint32Array> {
-    const extentNode = this.#extentNode;
-    const w = this.#imgW,
-      h = this.#imgH;
+    const extentNode = this.extentNode;
+    const w = this.imgW,
+      h = this.imgH;
     const x0 = Math.max(0, Math.min(w - 1, Math.floor(r?.x0 ?? 0)));
     const y0 = Math.max(0, Math.min(h - 1, Math.floor(r?.y0 ?? 0)));
     const x1 = Math.max(x0 + 1, Math.min(w, Math.ceil(r?.x1 ?? w)));
     const y1 = Math.max(y0 + 1, Math.min(h, Math.ceil(r?.y1 ?? h)));
-    this.#region.x0.value = x0;
-    this.#region.y0.value = y0;
-    this.#region.w.value = x1 - x0;
-    this.#region.count.value = (x1 - x0) * (y1 - y0);
-    await this.renderer.computeAsync([this.#extentClear, this.#extentAccum]);
+    this.region.x0.value = x0;
+    this.region.y0.value = y0;
+    this.region.w.value = x1 - x0;
+    this.region.count.value = (x1 - x0) * (y1 - y0);
+    await this.renderer.computeAsync([this.extentClear, this.extentAccum]);
     const buf = await this.renderer.getArrayBufferAsync(extentNode.value);
     return new Uint32Array(buf.slice(0));
   }
@@ -592,34 +669,39 @@ export class Pipeline {
     x: number,
     y: number,
   ): Promise<{ adjusted: RGB; original: RGB }> {
-    const pickOut = this.#pickOut;
-    this.#pick.x.value = x;
-    this.#pick.y.value = y;
-    await this.renderer.computeAsync(this.#pickPass);
+    const pickOut = this.pickOut;
+    this.pick.x.value = x;
+    this.pick.y.value = y;
+    await this.renderer.computeAsync(this.pickPass);
     const f = new Float32Array(
       await this.renderer.getArrayBufferAsync(pickOut.value),
     );
     return { adjusted: [f[0], f[1], f[2]], original: [f[4], f[5], f[6]] };
   }
 
-  // Run all passes, then read the histogram back. Returns 4*256 counts: R,G,B,luma.
+  /** Run all passes, then read the histogram back. Returns 4*256 counts: R,G,B,luma. */
   async render(): Promise<Uint32Array> {
-    if (!this.#rtA || !this.#rtB) return new Uint32Array(BINS * CHANNELS);
+    if (!this.rtA || !this.rtB) return new Uint32Array(BINS * CHANNELS);
     const r = this.renderer;
-    const histNode = this.#histNode; // captured: setImage() may swap it while we await
-    r.setRenderTarget(this.#rtA);
-    this.#quads[0].render(r);
-    r.setRenderTarget(this.#rtB);
-    this.#quads[1].render(r);
+    const histNode = this.histNode; // captured: setImage() may swap it while we await
+    r.setRenderTarget(this.rtA);
+    this.quads[0].render(r);
+    for (const slot of this.convSteps) {
+      r.setRenderTarget(slot.out);
+      slot.quad.render(r);
+    }
+    r.setRenderTarget(this.rtB);
+    this.tonalQuad().render(r);
     r.setRenderTarget(null);
-    this.#displayQuad()!.render(r);
-    await r.computeAsync([this.#clearPass, this.#accumPass]);
-    const buffer = await r.getArrayBufferAsync(histNode.value);
-    return new Uint32Array(buffer.slice(0));
+    this.displayQuad()!.render(r);
+    await r.computeAsync([this.clearPass, this.accumPass]);
+    const buf = await r.getArrayBufferAsync(histNode.value);
+    return new Uint32Array(buf.slice(0));
   }
 
+  /** True when the current image runs through the float32 (16-bit) path. */
   get isDeepPath() {
-    return this.#deepPath;
+    return this.deepPath;
   }
 
   /** The processed image as RGB floats in 0..1, top row first (for export). */
@@ -628,17 +710,17 @@ export class Pipeline {
     height: number;
     data: Float32Array;
   }> {
-    if (!this.#rtB) throw new Error("No image loaded");
-    const w = this.#imgW,
-      h = this.#imgH;
+    if (!this.rtB) throw new Error("No image loaded");
+    const w = this.imgW,
+      h = this.imgH;
     const raw: any = await this.renderer.readRenderTargetPixelsAsync(
-      this.#rtB,
+      this.rtB,
       0,
       0,
       w,
       h,
     );
-    const half = !this.#deepPath; // half-float targets come back as raw 16-bit half values
+    const half = !this.deepPath; // half-float targets come back as raw 16-bit half values
     const out = new Float32Array(w * h * 3);
     for (let i = 0, n = w * h; i < n; i++) {
       for (let c = 0; c < 3; c++) {
@@ -649,23 +731,107 @@ export class Pipeline {
     return { width: w, height: h, data: out };
   }
 
-  #disposeImage() {
-    this.#src?.dispose();
-    this.#rtA?.dispose();
-    this.#rtB?.dispose();
-    this.#quads.forEach((q) =>
+  // ───────────── convolution chain ─────────────
+
+  /**
+   * Set the filter chain. While its shape (sizes, order of flags) is unchanged only the
+   * weights, bias and amount are updated; otherwise the chain's passes are rebuilt.
+   */
+  setConvolution(snap: ConvSnapshot) {
+    this.convSnap = snap;
+    if (!this.rtA) return; // applied when the next image is set
+    if (snap.key !== this.convKey) this.rebuildConv();
+    this.applyConvValues();
+  }
+
+  private applyConvValues() {
+    this.convSnap.steps.forEach((st, i) => {
+      const slot = this.convSteps[i];
+      if (!slot) return;
+      st.weights.forEach((wgt, k) => (slot.weights[k].value = wgt));
+      slot.bias.value = st.bias;
+      slot.amount.value = st.amount;
+    });
+  }
+
+  private rebuildConv() {
+    const steps = this.convSnap.steps;
+    const n = steps.length;
+
+    this.convSteps.forEach((s) =>
+      (s.quad.material as THREE.Material | null)?.dispose(),
+    );
+    this.convSteps = [];
+
+    // Pass i reads the previous output and writes P (even i) or Q (odd i); pass 0 reads RT_A.
+    if (n >= 1 && !this.rtP) this.rtP = this.makeRT!();
+    if (n >= 2 && !this.rtQ) this.rtQ = this.makeRT!();
+    if (n < 2) this.releaseTarget("rtQ");
+    if (n < 1) this.releaseTarget("rtP");
+
+    let input = this.rtA!;
+    steps.forEach((st, i) => {
+      const out = i % 2 === 0 ? this.rtP! : this.rtQ!;
+      this.convSteps.push(this.makeConv!(input, out, st));
+      input = out;
+    });
+    this.convOut = input;
+    this.convKey = this.convSnap.key;
+  }
+
+  private releaseTarget(which: "rtP" | "rtQ") {
+    const rt = this[which];
+    if (!rt) return;
+    const q = this.tonalQuads.get(rt); // its tone pass reads this target, so it goes too
+    if (q) {
+      (q.material as THREE.Material | null)?.dispose();
+      this.tonalQuads.delete(rt);
+    }
+    rt.dispose();
+    this[which] = undefined;
+  }
+
+  /** The tone pass for the chain's current output, compiled the first time it is needed. */
+  private tonalQuad(): THREE.QuadMesh {
+    const input = this.convOut ?? this.rtA!;
+    let q = this.tonalQuads.get(input);
+    if (!q) {
+      q = this.makeTonal!(input);
+      this.tonalQuads.set(input, q);
+    }
+    return q;
+  }
+
+  private disposeImage() {
+    this.convSteps.forEach((s) =>
+      (s.quad.material as THREE.Material | null)?.dispose(),
+    );
+    this.convSteps = [];
+    this.tonalQuads.forEach((q) =>
       (q.material as THREE.Material | null)?.dispose(),
     );
-    this.#quads = [];
-    this.#displayQuads.forEach((q) =>
+    this.tonalQuads.clear();
+    this.rtP?.dispose();
+    this.rtQ?.dispose();
+    this.rtP = this.rtQ = undefined;
+    this.convKey = "";
+    this.convOut = undefined;
+    this.makeRT = this.makeTonal = this.makeConv = undefined;
+
+    this.src?.dispose();
+    this.rtA?.dispose();
+    this.rtB?.dispose();
+    this.quads.forEach((q) => (q.material as THREE.Material | null)?.dispose());
+    this.quads = [];
+    this.displayQuads.forEach((q) =>
       (q.material as THREE.Material | null)?.dispose(),
     );
-    this.#displayQuads.clear();
-    this.#makeDisplay = undefined;
+    this.displayQuads.clear();
+    this.makeDisplay = undefined;
   }
 
   dispose() {
-    this.#disposeImage();
+    this.disposeImage();
     this.renderer?.dispose();
   }
 }

@@ -1,4 +1,4 @@
-import type { RGB } from "./types";
+import type { RGB } from "./color";
 
 export interface StretchRange {
   black: RGB;

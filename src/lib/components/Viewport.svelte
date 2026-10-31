@@ -21,7 +21,7 @@
   }
   let drag: Drag | null = null;
 
-  // attachments
+  // ───────────── attachments ─────────────
 
   // Start the GPU once the canvas exists.
   const gpu: Attachment<HTMLCanvasElement> = (canvas) => {
@@ -48,9 +48,10 @@
       return () => node.removeEventListener("wheel", handler);
     };
 
-  // input handling
+  // ───────────── input handling ─────────────
 
-  // The handlers below are all attached to the stage, so `currentTarget` is the stage. It has the same box as the canvas, so no element references are needed.
+  // The handlers below are all attached to the stage, so `currentTarget` is the stage.
+  // It has the same box as the canvas, so no element references are needed.
   const local = (e: MouseEvent): [number, number] => {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     return [e.clientX - r.left, e.clientY - r.top];
@@ -145,6 +146,8 @@
   }
 </script>
 
+<!-- The stage is a custom pan/zoom widget: it is focusable and handles pointer and key input by design. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
 <div
   class="stage"
   role="application"
@@ -183,18 +186,19 @@
     <div class="toolbar">
       <button onclick={() => viewer.fit()}>Fit</button>
       <button onclick={() => viewer.actualSize()}>100%</button>
-      <select
-        class="select"
-        title="Resample"
-        value={viewer.interpolation}
-        onchange={(e) =>
-          viewer.setInterpolation(e.currentTarget.value as Interpolation)}
-      >
-        {#each INTERPOLATIONS as m (m.id)}
-          <option value={m.id} title={m.hint}>{m.label}</option>
-        {/each}
-      </select>
       <output>{viewer.zoomPct}%</output>
+      <label class="select">
+        <span>Resample</span>
+        <select
+          value={viewer.interpolation}
+          onchange={(e) =>
+            viewer.setInterpolation(e.currentTarget.value as Interpolation)}
+        >
+          {#each INTERPOLATIONS as m (m.id)}
+            <option value={m.id} title={m.hint}>{m.label}</option>
+          {/each}
+        </select>
+      </label>
     </div>
   {/if}
 
@@ -274,14 +278,5 @@
     border: 1px solid #fff;
     outline: 1px solid #000; /* dark outer edge keeps it visible on light areas */
     pointer-events: none;
-  }
-  .select {
-    flex: 1;
-    background: var(--well);
-    color: var(--ink);
-    border: 1px solid var(--edge);
-    border-radius: 4px;
-    padding: 0.3rem 0.4rem;
-    font: inherit;
   }
 </style>

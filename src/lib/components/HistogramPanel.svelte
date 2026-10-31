@@ -17,6 +17,18 @@
 
   let logScale = $state(false);
   const total = $derived(viewer.img.w * viewer.img.h);
+
+  const LUMA = [0.2126, 0.7152, 0.0722]; // same weights as the GPU histogram
+
+  /** Value of the picked pixel in a channel's histogram space, or null if nothing is picked. */
+  function markerFor(channel: number): number | null {
+    const p = viewer.picked;
+    if (!p) return null;
+    const [r, g, b] = p.adjusted;
+    return channel === 3
+      ? LUMA[0] * r + LUMA[1] * g + LUMA[2] * b
+      : p.adjusted[channel];
+  }
 </script>
 
 <Panel title="Histograms">
@@ -29,6 +41,7 @@
         lo={v.histLo}
         hi={v.histHi}
         {total}
+        marker={markerFor(c.channel)}
       />
     {/each}
   </div>
