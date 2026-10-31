@@ -186,19 +186,18 @@
     <div class="toolbar">
       <button onclick={() => viewer.fit()}>Fit</button>
       <button onclick={() => viewer.actualSize()}>100%</button>
+      <select
+        class="select"
+        title="Interpolation"
+        value={viewer.interpolation}
+        onchange={(e) =>
+          viewer.setInterpolation(e.currentTarget.value as Interpolation)}
+      >
+        {#each INTERPOLATIONS as m (m.id)}
+          <option value={m.id} title={m.hint}>{m.label}</option>
+        {/each}
+      </select>
       <output>{viewer.zoomPct}%</output>
-      <label class="select">
-        <span>Resample</span>
-        <select
-          value={viewer.interpolation}
-          onchange={(e) =>
-            viewer.setInterpolation(e.currentTarget.value as Interpolation)}
-        >
-          {#each INTERPOLATIONS as m (m.id)}
-            <option value={m.id} title={m.hint}>{m.label}</option>
-          {/each}
-        </select>
-      </label>
     </div>
   {/if}
 
@@ -278,5 +277,15 @@
     border: 1px solid #fff;
     outline: 1px solid #000; /* dark outer edge keeps it visible on light areas */
     pointer-events: none;
+  }
+  .select {
+    flex: 1;
+    min-width: 0; /* a select's intrinsic width would otherwise stop it shrinking */
+    background: var(--well);
+    color: var(--ink);
+    border: 1px solid var(--edge);
+    border-radius: 4px;
+    padding: 0.3rem 0.4rem;
+    font: inherit;
   }
 </style>

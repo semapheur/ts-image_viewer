@@ -32,9 +32,14 @@
 />
 
 <main>
-  <aside>
+  <aside class="left">
     <div class="actions">
-      <button onclick={params.reset}>Reset all</button>
+      <button
+        onclick={() => {
+          params.reset();
+          conv.reset();
+        }}>Reset all</button
+      >
       <FilePicker
         class="button"
         disabled={viewer.loading}
@@ -52,7 +57,7 @@
   </aside>
   <Viewport />
 
-  <aside>
+  <aside class="right">
     <HistogramPanel />
     <PixelPanel />
   </aside>
@@ -61,15 +66,24 @@
 <style>
   main {
     display: grid;
-    grid-template-columns: auto 1fr auto;
+    grid-template-columns:
+      22rem minmax(0, 1fr)
+      22rem; /* fixed sidebars, flexible viewport */
     height: 100vh;
   }
   aside {
     display: grid;
-    gap: 1.25rem;
+    grid-template-columns: minmax(
+      0,
+      1fr
+    ); /* items may shrink to the sidebar's width */
+    gap: 0.75rem;
     align-content: start;
-    padding: 1rem;
+    min-width: 0;
+    padding: 0.5rem 1rem;
+    overflow-x: hidden;
     overflow-y: auto;
+    scrollbar-gutter: stable;
     background: var(--panel);
   }
   .actions {
@@ -78,8 +92,13 @@
   }
   @media (max-width: 800px) {
     main {
-      grid-template-columns: 1fr;
-      grid-template-rows: 50vh 1fr;
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: 50vh auto auto;
+      height: auto;
+      min-height: 100vh;
+    }
+    main > :global(.stage) {
+      order: -1; /* viewport first when the sidebars stack */
     }
   }
 </style>

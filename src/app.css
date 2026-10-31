@@ -67,6 +67,7 @@ select:focus-visible {
 
 .select select {
   flex: 1;
+  min-width: 0;
   background: var(--well);
   color: var(--ink);
   border: 1px solid var(--edge);

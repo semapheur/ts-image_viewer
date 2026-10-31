@@ -44,6 +44,7 @@
 
 <div class="row">
   <span>{label}</span>
+  <output>{lo.toFixed(2)}–{hi.toFixed(2)}</output>
 
   <!-- Double-click anywhere on the control resets both ends. -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -77,17 +78,19 @@
       style:z-index="2"
     />
   </div>
-
-  <output>{lo.toFixed(2)}–{hi.toFixed(2)}</output>
 </div>
 
 <style>
+  /* Label and readout share the first line; the track then spans the full width below them. */
   .row {
     display: grid;
-    grid-template-columns: 6.5rem 1fr 6rem;
+    grid-template-columns: minmax(0, 1fr) auto;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.1rem 0.5rem;
     font-size: 0.85rem;
+  }
+  .control {
+    grid-column: 1 / -1;
   }
   output {
     text-align: right;

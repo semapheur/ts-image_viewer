@@ -39,7 +39,7 @@
   </div>
 
   <dl>
-    <dt class="rgb-label" title="Red, Green, Blue">RGB</dt>
+    <dt class="wrap-row" title="Red, Green, Blue">RGB</dt>
     <dd>
       {String(level(adjusted[0]))}, {String(level(adjusted[1]))}, {String(
         level(adjusted[2]),
@@ -56,25 +56,29 @@
     </dd>
     <dt>Hex</dt>
     <dd>{hex(adjusted)} <span class="muted">(was {hex(original)})</span></dd>
-    <dt title="Hue, Saturation, Lighness">HSL</dt>
+    <dt class="wrap-row" title="Hue, Saturation, Lighness">HSL</dt>
     <dd>
       {deg(hslAdjusted.h)}, {pct(hslAdjusted.s)}, {pct(hslAdjusted.l)}
+    </dd>
+    <dd>
       <span class="muted">
         (was {deg(hslOriginal.h)}, {pct(hslOriginal.s)}, {pct(hslOriginal.l)})
       </span>
     </dd>
-    <dt title="Lightness, Chroma, Hue">OKLCH</dt>
+    <dt class="wrap-row" title="Lightness, Chroma, Hue">OKLCH</dt>
     <dd>
       {pct(oklchAdjusted.l)}, {oklchAdjusted.c.toFixed(3)}, {deg(
         oklchAdjusted.h,
       )}
+    </dd>
+    <dd>
       <span class="muted">
         (was {pct(oklchOriginal.l)}, {oklchOriginal.c.toFixed(3)}, {deg(
           oklchOriginal.h,
         )})
       </span>
     </dd>
-    <dt>Position (x, y)</dt>
+    <dt title="x, y">Position</dt>
     <dd>{x}, {y}</dd>
   </dl>
 </div>
@@ -94,7 +98,7 @@
     margin: 0;
   }
   .swatch {
-    height: 2.75rem;
+    height: 2rem;
     border-radius: 3px;
     box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.18);
   }
@@ -117,7 +121,7 @@
     margin: 0;
     font-variant-numeric: tabular-nums;
   }
-  .rgb-label {
+  .wrap-row {
     grid-row: span 2;
     align-self: start;
   }

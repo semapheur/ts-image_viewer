@@ -81,9 +81,10 @@
   }
 
   function move(e: PointerEvent) {
-    if (!dragging) return;
     const p = pointer(e);
-    if (p) apply(p.u + offset.u, p.v + offset.v);
+    if (!p) return;
+    if (dragging) apply(p.u + offset.u, p.v + offset.v);
+    else hovering = Math.hypot(p.px - handle.x, p.py - handle.y) < HIT; // tooltip only near the handle
   }
 
   const end = () => (dragging = false);
@@ -110,9 +111,11 @@
   }
 </script>
 
-<div>
-  <div class="row">
-    <span>Sigmoidal</span>
+<div class="sigmoid">
+  <!-- Title and Reset share the first line; the readout gets its own, so nothing can overflow. -->
+  <div class="head">
+    <span class="title">Sigmoidal</span>
+    <button onclick={reset}>Reset</button>
     <p class="hint">
       Contrast <span class="num contrast-num">{v.sigmoidAmount.toFixed(1)}</span
       >
@@ -121,9 +124,8 @@
         >· off</span
       >
     </p>
-    <button onclick={reset}>Reset</button>
   </div>
-  <div class="label"></div>
+
   <svg
     bind:this={svg}
     class="plot"
@@ -142,6 +144,7 @@
     onpointermove={move}
     onpointerup={end}
     onpointercancel={end}
+    onpointerleave={() => (hovering = false)}
     onlostpointercapture={end}
     onkeydown={key}
   >
@@ -157,14 +160,8 @@
     <!-- guide through the midpoint -->
     <line class="guide" x1={handle.x} x2={handle.x} y1={T} y2={T + H} />
 
-    <!-- interactive drag handle with hover tooltip -->
-    <g
-      class="handle-group"
-      role="button"
-      tabindex="0"
-      onpointerenter={() => (hovering = true)}
-      onpointerleave={() => (hovering = false)}
-    >
+    <!-- drag handle: purely visual, the svg itself is the slider -->
+    <g class="handle-group" aria-hidden="true">
       <circle class="hit" cx={handle.x} cy={handle.y} r={HIT} />
       <circle class="halo" cx={handle.x} cy={handle.y} r="6" />
       <circle class="handle" cx={handle.x} cy={handle.y} r="4" />
@@ -180,9 +177,31 @@
 </div>
 
 <style>
+  .sigmoid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr); /* never wider than the sidebar */
+    gap: 0.4rem;
+    min-width: 0;
+  }
+  .head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 0.25rem 0.5rem;
+    font-size: 0.85rem;
+  }
+  .hint {
+    grid-column: 1 / -1;
+    min-width: 0;
+    margin: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
   .plot {
     display: block;
     width: 100%;
+    height: auto;
     aspect-ratio: 264 / 118;
     color: var(--ink);
     touch-action: none;
@@ -252,7 +271,6 @@
     transition: opacity 0.12s;
     pointer-events: none;
   }
-  .plot:hover .halo,
   .plot:focus-visible .halo,
   .dragging .halo,
   .handle-group:hover .halo {
@@ -278,17 +296,6 @@
     text-anchor: middle;
     dominant-baseline: central;
     user-select: none;
-  }
-  .row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 0.85rem;
-    gap: 0.5rem;
-  }
-  .hint {
-    white-space: nowrap;
-    margin: 0;
   }
   .num {
     display: inline-block;

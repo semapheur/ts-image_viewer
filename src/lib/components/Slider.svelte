@@ -9,6 +9,7 @@
     step?: number;
     neutral?: number;
     disabled?: boolean;
+    /** If given, a plot of this transfer curve appears while the slider is being adjusted. */
     curve?: (x: number, value: number) => number;
   }
 
@@ -112,7 +113,7 @@
     <CurvePlot fn={(x) => curve(x, value)} size={TIP_W - 16} />
     <p>
       {label}
-      {value.toFixed(2)} <br /> mid-grey 0.50 → {curve(0.5, value).toFixed(2)}
+      {value.toFixed(2)} · mid-grey 0.50 → {curve(0.5, value).toFixed(2)}
     </p>
   </div>
 {/if}
@@ -120,7 +121,7 @@
 <style>
   .row {
     display: grid;
-    grid-template-columns: 6.5rem 1fr 3rem;
+    grid-template-columns: 6.5rem minmax(0, 1fr) 3rem;
     align-items: center;
     gap: 0.5rem;
     font-size: 0.85rem;
