@@ -113,7 +113,7 @@
     <CurvePlot fn={(x) => curve(x, value)} size={TIP_W - 16} />
     <p>
       {label}
-      {value.toFixed(2)} · mid-grey 0.50 → {curve(0.5, value).toFixed(2)}
+      {value.toFixed(2)} <br /> mid-grey 0.50 → {curve(0.5, value).toFixed(2)}
     </p>
   </div>
 {/if}
